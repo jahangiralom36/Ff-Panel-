@@ -1881,6 +1881,39 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'live_generate') {
 // ====================================================================
 // 9. HWID RESET AJAX HANDLER (Requires Plan & Key)
 // ====================================================================
+// Supported HWID reset products (keymanager.shop api_id => label)
+if (!function_exists('ffResetProducts')) {
+    function ffResetProducts(): array {
+        return [
+            2  => 'DRIPCLIENT',
+            4  => 'FLUORITE',
+            9  => 'Haxxcker Reset',
+            3  => 'HGCHEATS',
+            11 => 'Silent Cheats APKMOD',
+            12 => 'Silent Cheats Root',
+            99 => 'Angry Mod (Pinxt)',
+        ];
+    }
+}
+// Detect reset api_id from product name (+ plan title for Silent Cheats)
+if (!function_exists('ffResetApiIdFromName')) {
+    function ffResetApiIdFromName(string $productName, string $extra = ''): int {
+        $n = strtolower(preg_replace('/[^a-z0-9]/i', '', $productName));
+        $f = strtolower(preg_replace('/[^a-z0-9]/i', '', $productName . ' ' . $extra));
+        if (strpos($n, 'silent') !== false) {
+            if (strpos($f, 'apk') !== false)  return 11;
+            if (strpos($f, 'root') !== false) return 12;
+            return 0;
+        }
+        if (strpos($n, 'angry') !== false || strpos($n, 'pinxt') !== false) return 99;
+        if (strpos($n, 'drip') !== false)     return 2;
+        if (strpos($n, 'fluorite') !== false) return 4;
+        if (strpos($n, 'haxxcker') !== false || strpos($n, 'haxcker') !== false) return 9;
+        if (strpos($n, 'hgcheat') !== false)  return 3;
+        return 0;
+    }
+}
+
 if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'reset_key') {
     while (ob_get_level()) { ob_end_clean(); }
     header('Content-Type: application/json; charset=utf-8');
@@ -1890,55 +1923,25 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'reset_key') {
         exit;
     }
 
-    $rawKey = trim($_POST['license_key'] ?? '');
-    $planId = (int)($_POST['plan_id'] ?? 0);
+    $rawKey     = trim($_POST['license_key'] ?? '');
+    $resetApiId = (int)($_POST['api_id'] ?? 0);
+    $resetList  = ffResetProducts();
 
-    if (empty($rawKey) || $planId <= 0) {
-        echo json_encode(['status' => 'error', 'message' => 'Please select a valid plan and enter a license key!']);
+    if ($rawKey === '' || !isset($resetList[$resetApiId])) {
+        echo json_encode(['status' => 'error', 'message' => 'Please select a product and enter a license key!']);
         exit;
     }
 
-    $stmtKey = $pdo->prepare("SELECT * FROM `licenses` WHERE `user_id` = ? AND `license_key` = ? AND `plan_id` = ? LIMIT 1");
-    $stmtKey->execute([$user['id'], $rawKey, $planId]);
-    $keyRow = $stmtKey->fetch(PDO::FETCH_ASSOC);
+    // If this key belongs to the user's account and admin stopped it, block reset
+    $keyRow = null;
+    try {
+        $stmtKey = $pdo->prepare("SELECT * FROM `licenses` WHERE `user_id` = ? AND `license_key` = ? LIMIT 1");
+        $stmtKey->execute([$user['id'], $rawKey]);
+        $keyRow = $stmtKey->fetch(PDO::FETCH_ASSOC) ?: null;
+    } catch (Throwable $e) {}
 
-    if (!$keyRow) {
-        echo json_encode(['status' => 'error', 'message' => 'License key not found for the selected plan in your account!']);
-        exit;
-    }
-
-    if (($keyRow['status'] ?? 'active') === 'stopped') {
+    if ($keyRow && ($keyRow['status'] ?? 'active') === 'stopped') {
         echo json_encode(['status' => 'error', 'message' => 'This key has been stopped by admin. Please contact support.']);
-        exit;
-    }
-
-    // ---- KEYMANAGER HWID RESET (only 7 supported products) ----
-    $stmtProd = $pdo->prepare("SELECT p.name AS product_name, COALESCE(pl.plan_title, '') AS plan_title, COALESCE(pl.validity, '') AS plan_validity
-                               FROM `product_plans` pl JOIN `products` p ON pl.product_id = p.id WHERE pl.id = ? LIMIT 1");
-    $stmtProd->execute([$planId]);
-    $prodRow = $stmtProd->fetch(PDO::FETCH_ASSOC) ?: [];
-
-    $nameHay = strtolower(preg_replace('/[^a-z0-9]/i', '', (string)($prodRow['product_name'] ?? '')));
-    $fullHay = strtolower(preg_replace('/[^a-z0-9]/i', '', ($prodRow['product_name'] ?? '') . ' ' . ($prodRow['plan_title'] ?? '') . ' ' . ($prodRow['plan_validity'] ?? '') . ' ' . ($keyRow['validity'] ?? '')));
-
-    $resetApiId = 0;
-    if (strpos($nameHay, 'silent') !== false) {
-        if (strpos($fullHay, 'apk') !== false)       $resetApiId = 11; // Silent Cheats APKMOD
-        elseif (strpos($fullHay, 'root') !== false)  $resetApiId = 12; // Silent Cheats Root
-    } elseif (strpos($nameHay, 'angry') !== false || strpos($nameHay, 'pinxt') !== false) {
-        $resetApiId = 99; // Angry Mod (Pinxt)
-    } elseif (strpos($nameHay, 'drip') !== false) {
-        $resetApiId = 2;  // DRIPCLIENT
-    } elseif (strpos($nameHay, 'fluorite') !== false) {
-        $resetApiId = 4;  // FLUORITE
-    } elseif (strpos($nameHay, 'haxxcker') !== false || strpos($nameHay, 'haxcker') !== false) {
-        $resetApiId = 9;  // Haxxcker Reset
-    } elseif (strpos($nameHay, 'hgcheat') !== false) {
-        $resetApiId = 3;  // HGCHEATS
-    }
-
-    if ($resetApiId <= 0) {
-        echo json_encode(['status' => 'error', 'message' => 'Reset is not supported for this product. Supported: DRIPCLIENT, FLUORITE, Haxxcker, HGCHEATS, Silent Cheats APKMOD, Silent Cheats Root, Angry Mod (Pinxt).']);
         exit;
     }
 
@@ -1980,9 +1983,11 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'reset_key') {
     $resetMsg = is_array($resetRes) ? (string)($resetRes['message'] ?? $resetRes['msg'] ?? '') : '';
 
     if ($resetOk) {
-        try {
-            $pdo->prepare("UPDATE `licenses` SET `updated_at` = NOW() WHERE `id` = ?")->execute([$keyRow['id']]);
-        } catch (Throwable $e) {}
+        if ($keyRow) {
+            try {
+                $pdo->prepare("UPDATE `licenses` SET `updated_at` = NOW() WHERE `id` = ?")->execute([$keyRow['id']]);
+            } catch (Throwable $e) {}
+        }
         echo json_encode(['status' => 'success', 'message' => $resetMsg !== '' ? $resetMsg : 'Hardware ID successfully reset!']);
         exit;
     }
@@ -2611,17 +2616,25 @@ if ($isLoggedIn) {
 }
 $coinInitial = ffCoinPayload($pdo, $settings, $isLoggedIn ? (int)$user['id'] : 0, (float)$effectiveBdtRate);
 
-// Build a map of plan_id => user's keys (for reset auto-suggest JS fallback)
+// Build a map of reset api_id => user's keys (for reset auto-suggest chips)
 $userKeysByPlan = [];
-foreach ($keys as $k) {
-    $pid = (int)$k['plan_id'];
-    if (!isset($userKeysByPlan[$pid])) $userKeysByPlan[$pid] = [];
-    if (count($userKeysByPlan[$pid]) < 50) {
-        $userKeysByPlan[$pid][] = [
-            'license_key' => $k['license_key'],
-            'validity'    => $k['validity'],
-        ];
-    }
+if ($isLoggedIn) {
+    try {
+        $stmtRk = $pdo->prepare("SELECT l.license_key, l.validity, COALESCE(p.name, '') AS product_name, COALESCE(pl.plan_title, '') AS plan_title
+                                 FROM `licenses` l
+                                 LEFT JOIN `product_plans` pl ON pl.id = l.plan_id
+                                 LEFT JOIN `products` p ON p.id = pl.product_id
+                                 WHERE l.user_id = ? ORDER BY l.id DESC LIMIT 100");
+        $stmtRk->execute([$user['id']]);
+        foreach ($stmtRk->fetchAll(PDO::FETCH_ASSOC) as $rk) {
+            $rid = ffResetApiIdFromName((string)$rk['product_name'], $rk['plan_title'] . ' ' . $rk['validity']);
+            if ($rid <= 0) continue;
+            if (!isset($userKeysByPlan[$rid])) $userKeysByPlan[$rid] = [];
+            if (count($userKeysByPlan[$rid]) < 50) {
+                $userKeysByPlan[$rid][] = ['license_key' => $rk['license_key'], 'validity' => $rk['validity']];
+            }
+        }
+    } catch (Throwable $e) {}
 }
 
 // Build Google Auth URL (FIXED - READS FROM DATABASE SETTINGS)
@@ -2638,7 +2651,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
     <title><?= htmlspecialchars($storeTitleName) ?> — Official Store</title>
     
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     
     <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -3065,6 +3078,10 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
             white-space: pre-line;
             word-break: break-word;
         }
+        /* PERFORMANCE: blur effects are very heavy on mobile GPUs -> disable for smooth scrolling */
+        .backdrop-blur-sm, .backdrop-blur-md, .backdrop-blur, .backdrop-blur-lg { -webkit-backdrop-filter: none !important; backdrop-filter: none !important; }
+        header.sticky { will-change: transform; transform: translateZ(0); }
+        @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; } }
     </style>
 </head>
 <body class="min-h-screen w-full flex flex-col justify-between relative pb-24">
@@ -3741,7 +3758,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
                     <h2 class="text-sm font-black tracking-wider text-slate-900 uppercase flex items-center justify-center gap-2">
                         <i class="fa-solid fa-arrows-rotate text-emerald-600"></i> RESET LICENSE HARDWARE ID
                     </h2>
-                    <p class="text-[11px] text-slate-500 mt-0.5 font-sans">Select plan → pick your key → reset HWID</p>
+                    <p class="text-[11px] text-slate-500 mt-0.5 font-sans">Select product → enter your key → reset HWID</p>
                 </div>
 
                 <?php if (!$isLoggedIn): ?>
@@ -3755,21 +3772,14 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
                 <?php else: ?>
                     <form id="liveResetForm" onsubmit="handleLiveKeyReset(event)" class="space-y-3 text-xs font-sans">
 
-                        <!-- STEP 1: Plan selector (product + plan shown) -->
+                        <!-- STEP 1: Product selector (7 supported reset products) -->
                         <div class="space-y-1">
-                            <label class="text-[11px] font-bold text-slate-700 block">Step 1 — Select Plan</label>
+                            <label class="text-[11px] font-bold text-slate-700 block">Step 1 — Select Product</label>
                             <select id="resetPlanSelect" onchange="onResetPlanChange(this.value)" required class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl outline-none focus:border-emerald-500 text-slate-900">
-                                <option value="">-- Choose Plan --</option>
-                                <?php 
-                                $uniquePlansForReset = [];
-                                foreach($keys as $k) {
-                                    $pKey = $k['plan_id'] . '_' . $k['validity'];
-                                    if(!in_array($pKey, $uniquePlansForReset)) {
-                                        $uniquePlansForReset[] = $pKey;
-                                        echo '<option value="'.$k['plan_id'].'">'.htmlspecialchars($k['validity']).'</option>';
-                                    }
-                                }
-                                ?>
+                                <option value="">-- Choose Product --</option>
+                                <?php foreach (ffResetProducts() as $rId => $rName): ?>
+                                    <option value="<?= (int)$rId ?>"><?= htmlspecialchars($rName) ?></option>
+                                <?php endforeach; ?>
                             </select>
                         </div>
 
@@ -5528,7 +5538,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
                 }
             } catch (e) {}
         }
-        setInterval(refreshPaymentMethods, 6000);
+        setInterval(() => { if (!document.hidden) refreshPaymentMethods(); }, 30000);
         document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshPaymentMethods(); });
 
         // ============ COIN SYSTEM (live) ============
@@ -5669,7 +5679,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
         document.addEventListener('DOMContentLoaded', () => {
             renderCoinUI();
             if (isUserLoggedIn) {
-                setInterval(refreshCoinData, 4000);
+                setInterval(() => { if (!document.hidden) refreshCoinData(); }, 20000);
                 document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshCoinData(); });
             }
         });
@@ -5900,7 +5910,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
             const key = document.getElementById('resetKeySearchInput').value.trim();
             
             if (!planId || !key) {
-                showToast('Please select a plan and enter a key.', 'error');
+                showToast('Please select a product and enter a key.', 'error');
                 return;
             }
 
@@ -5909,7 +5919,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
 
             const fd = new FormData();
             fd.append('ajax_action', 'reset_key');
-            fd.append('plan_id', planId);
+            fd.append('api_id', planId);
             fd.append('license_key', key);
 
             try {
