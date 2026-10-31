@@ -529,9 +529,9 @@ $settings = [
     'support_facebook'             => '',
     'support_channel'              => '',
     'auto_payment_on'              => '0',
-    'snzpay_api_url'               => 'https://snzpay.digital/api/verify_payment.php',
-    'snzpay_license_key'           => '',
-    'snzpay_auto_verify'           => '0',
+    'skypay_base_url'              => 'https://core.skypaybd.top',
+    'skypay_brand_key'             => '',
+    'skypay_auto_verify'           => '0',
     'deposit_system_status'        => '1',
     'site_maintenance_mode'        => '0',
     'site_maintenance_msg'         => 'We are currently upgrading our systems. Please check back later.',
@@ -682,75 +682,145 @@ function ffTrxAttemptClear(PDO $pdo, string $trxId): void {
 // ====================================================================
 // 4. GATEWAY & EXTERNAL PROVIDER ENGINE
 // ====================================================================
-function verifyWithSnzPay(string $trxId, string $method, float $amountBdt, array $storeSettings): array {
-    $apiUrl   = !empty($storeSettings['snzpay_api_url']) ? trim($storeSettings['snzpay_api_url']) : 'https://core.skypaybd.top/api/payment/verify';
-    $brandKey = trim($storeSettings['snzpay_license_key'] ?? '');
+// ====================================================================
+// SKYPAY BD (Headless API v2) — create session + verify by TrxID / Order ID
+// Docs: https://github.com/SkyPayBD/Docs  (BRAND-KEY header)
+// ====================================================================
+if (!defined('SKYPAY_DEFAULT_BRAND_KEY')) define('SKYPAY_DEFAULT_BRAND_KEY', '9ymnjszyhG5awJbTgp');
+if (!defined('SKYPAY_DEFAULT_BASE_URL'))  define('SKYPAY_DEFAULT_BASE_URL', 'https://core.skypaybd.top');
 
-    if (empty($brandKey)) {
-        return ['status' => 'error', 'message' => 'SkyPay Gateway configuration missing! Please add Brand Key.'];
+if (!function_exists('skypayConfig')) {
+    function skypayConfig(array $s): array {
+        $key = trim((string)($s['skypay_brand_key'] ?? ''));
+        if ($key === '' || $key === '0') {
+            $old = trim((string)($s['snzpay_license_key'] ?? '')); // migrate old saved key
+            $key = ($old !== '' && $old !== '0') ? $old : SKYPAY_DEFAULT_BRAND_KEY;
+        }
+        $base = trim((string)($s['skypay_base_url'] ?? ''));
+        if ($base === '' || $base === '0' || stripos($base, 'skypaybd') === false) $base = SKYPAY_DEFAULT_BASE_URL;
+        $base = preg_replace('#/api/.*$#i', '', rtrim($base, '/'));
+        return ['brand_key' => $key, 'base_url' => $base];
     }
-
-    $cleanTrx    = strtoupper(trim($trxId));
-    $cleanMethod = strtolower(trim($method));
-    if (strpos($cleanMethod, 'bkash') !== false) $cleanMethod = 'bkash';
-    elseif (strpos($cleanMethod, 'nagad') !== false) $cleanMethod = 'nagad';
-    elseif (strpos($cleanMethod, 'rocket') !== false) $cleanMethod = 'rocket';
-    elseif (strpos($cleanMethod, 'binance') !== false) $cleanMethod = 'binance';
-
-    $payload = [
-        "transaction_id" => $cleanTrx,
-        "trx_id"         => $cleanTrx,
-        "method"         => $cleanMethod,
-        "amount"         => (float)$amountBdt
-    ];
-
-    $ch = curl_init($apiUrl);
-    curl_setopt_array($ch, [
-        CURLOPT_POST           => true,
-        CURLOPT_POSTFIELDS     => json_encode($payload),
-        CURLOPT_HTTPHEADER     => [
-            'BRAND-KEY: ' . $brandKey,
-            'Content-Type: application/json',
-            'Accept: application/json'
-        ],
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 15,
-        CURLOPT_CONNECTTIMEOUT => 5,
-        CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_SSL_VERIFYHOST => false
-    ]);
-
-    $res = curl_exec($ch);
-    $curlErr = curl_error($ch);
-    $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-
-    if ($curlErr) {
-        return ['status' => 'error', 'server_error' => true, 'message' => 'Payment server is not responding right now. Please try again.'];
-    }
-
-    $result = json_decode($res ?: '', true);
-    if (!is_array($result)) {
-        return ['status' => 'error', 'server_error' => true, 'message' => 'Payment server error' . ($httpCode ? ' (HTTP ' . $httpCode . ')' : '') . '. Please try again.'];
-    }
-    if ($result && (
-        (isset($result['status']) && ($result['status'] === true || $result['status'] === 'success')) ||
-        (isset($result['data']['status']) && strtoupper($result['data']['status']) === 'COMPLETED')
-    )) {
-        return [
-            'status'  => 'success',
-            'amount'  => (float)($result['data']['amount'] ?? $amountBdt),
-            'sender'  => $result['data']['sender'] ?? ($result['data']['mobile_number'] ?? ''),
-            'trx_id'  => $result['data']['transaction_id'] ?? $cleanTrx,
-            'message' => $result['message'] ?? 'Payment verified successfully.'
-        ];
-    }
-
-    return [
-        'status'  => 'error',
-        'message' => $result['message'] ?? 'Transaction verification failed at SkyPay gateway!'
-    ];
 }
+
+if (!function_exists('skypayAutoOn')) {
+    function skypayAutoOn(array $s): bool {
+        return (($s['auto_payment_on'] ?? '0') === '1')
+            || ((string)($s['skypay_auto_verify'] ?? '0') === '1')
+            || ((string)($s['snzpay_auto_verify'] ?? '0') === '1'); // old saved setting
+    }
+}
+
+if (!function_exists('skypayHttp')) {
+    function skypayHttp(string $url, string $brandKey, array $payload): array {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => json_encode($payload),
+            CURLOPT_HTTPHEADER     => [
+                'BRAND-KEY: ' . $brandKey,
+                'Content-Type: application/json',
+                'Accept: application/json'
+            ],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 20,
+            CURLOPT_CONNECTTIMEOUT => 8,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_SSL_VERIFYHOST => false
+        ]);
+        $raw  = curl_exec($ch);
+        $err  = curl_error($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        $json = json_decode(is_string($raw) ? $raw : '', true);
+        return ['http' => $code, 'err' => $err, 'json' => is_array($json) ? $json : null];
+    }
+}
+
+if (!function_exists('skypayMethod')) {
+    function skypayMethod(string $m): string {
+        $m = strtolower($m);
+        if (strpos($m, 'bep20') !== false || strpos($m, 'bsc') !== false) return 'bep20';
+        if (strpos($m, 'binance') !== false || strpos($m, 'usdt') !== false) return 'binance';
+        if (strpos($m, 'nagad') !== false)  return 'nagad';
+        if (strpos($m, 'rocket') !== false) return 'rocket';
+        if (strpos($m, 'upay') !== false)   return 'upay';
+        if (strpos($m, 'qr') !== false)     return 'banglaqr';
+        return 'bkash';
+    }
+}
+
+if (!function_exists('skypayVerifyTrx')) {
+    /**
+     * Verify a customer TrxID / Order ID with SkyPay v2.
+     * Returns ['status'=>'success','amount','sender','trx_id','message'] or
+     *         ['status'=>'error','message', 'duplicate'?, 'server_error'?]
+     */
+    function skypayVerifyTrx(array $s, string $trxId, string $method, float $amountBdt, string $cusName = 'Customer', array $meta = []): array {
+        $cfg = skypayConfig($s);
+        $m   = skypayMethod($method);
+        $trx = trim($trxId);
+        $trx = ($m === 'bep20') ? strtolower($trx) : strtoupper($trx);
+
+        if ($trx === '') return ['status' => 'error', 'message' => 'Please enter your TrxID / Order ID!'];
+        if ($amountBdt <= 0) return ['status' => 'error', 'message' => 'Invalid payment amount!'];
+
+        // 1) create payment session (amount is checked by SkyPay against the real payment)
+        $c = skypayHttp($cfg['base_url'] . '/api/v2/payment/create', $cfg['brand_key'], [
+            'cus_name'  => $cusName !== '' ? $cusName : 'Customer',
+            'amount'    => round($amountBdt, 2),
+            'meta_data' => (object)$meta,
+        ]);
+        if ($c['err'] !== '' || $c['json'] === null || $c['http'] >= 500) {
+            return ['status' => 'error', 'server_error' => true, 'message' => 'Payment server is not responding right now. Please try again.'];
+        }
+        $sessionId = (string)($c['json']['id'] ?? ($c['json']['data']['id'] ?? ''));
+        if (empty($c['json']['status']) || $sessionId === '') {
+            return ['status' => 'error', 'server_error' => true, 'message' => 'Payment gateway: ' . ($c['json']['message'] ?? 'Could not start verification session.')];
+        }
+
+        // 2) verify (SMS can arrive 5-20s late -> retry "not found" a few times)
+        $tries = in_array($m, ['bkash', 'nagad', 'rocket', 'upay', 'banglaqr'], true) ? 3 : 2;
+        $v = null;
+        for ($i = 1; $i <= $tries; $i++) {
+            $v = skypayHttp($cfg['base_url'] . '/api/v2/payment/verify', $cfg['brand_key'], [
+                'id'             => $sessionId,
+                'method'         => $m,
+                'transaction_id' => $trx,
+            ]);
+            $j = $v['json'];
+            if ($v['err'] === '' && is_array($j) && $j['status'] === true) {
+                $d  = is_array($j['data'] ?? null) ? $j['data'] : [];
+                $st = strtoupper((string)($d['status'] ?? 'COMPLETED'));
+                if ($st === 'COMPLETED' || $st === 'SUCCESS' || $st === 'PAID') {
+                    $paid = (float)($d['amount'] ?? 0);
+                    return [
+                        'status'  => 'success',
+                        'amount'  => $paid > 0 ? $paid : $amountBdt,
+                        'sender'  => (string)($d['sender'] ?? ($d['mobile_number'] ?? '')),
+                        'trx_id'  => (string)($d['transaction_id'] ?? $trx),
+                        'message' => (string)($j['message'] ?? 'Payment verified successfully.'),
+                    ];
+                }
+                return ['status' => 'error', 'message' => 'Payment is ' . $st . '. Please try again later.'];
+            }
+            $retryable = ($v['err'] !== '' || $j === null || $v['http'] === 404 || $v['http'] >= 500);
+            if (!$retryable || $i === $tries) break;
+            sleep(5);
+        }
+
+        $j   = $v['json'];
+        $msg = is_array($j) ? (string)($j['message'] ?? '') : '';
+        if ($v['err'] !== '' || $j === null || $v['http'] >= 500) {
+            return ['status' => 'error', 'server_error' => true, 'message' => 'Payment server is not responding right now. Please try again.'];
+        }
+        if ($v['http'] === 400 && stripos($msg, 'already') !== false) {
+            return ['status' => 'error', 'duplicate' => true, 'message' => 'This TrxID has already been used!'];
+        }
+        return ['status' => 'error', 'message' => $msg !== '' ? $msg : 'Transaction ID not found. Please check your TrxID and try again.'];
+    }
+}
+
 
 if (!function_exists('generateFromExternalProvider')) {
     function generateFromExternalProvider($apiPlanId, $quantity = 1) {
@@ -1466,18 +1536,22 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_and_delive
             exit;
         }
     } else {
-        $isAutoPaymentEnforced = (($settings['auto_payment_on'] ?? '0') === '1') || (($settings['snzpay_auto_verify'] ?? '0') === '1');
+        $isAutoPaymentEnforced = skypayAutoOn($settings);
         
         if ($isAutoPaymentEnforced) {
-            $gatewayMethod = ($methodKey === 'usdt') ? 'BINANCE' : strtoupper($gatewayKey);
-            $snzRes = verifyWithSnzPay($trxId, $gatewayMethod, $totalCostBdt, $settings);
+            $gatewayMethod = ($methodKey === 'usdt') ? ('usdt ' . $gatewayKey) : $gatewayKey;
+            $payRes = skypayVerifyTrx($settings, $trxId, $gatewayMethod, (float)$totalCostBdt, (string)($user['username'] ?? 'Customer'), ['user_id' => (int)$user['id'], 'type' => 'order', 'plan_id' => $planId]);
             
-            if ($snzRes['status'] === 'success') {
+            if ($payRes['status'] === 'success') {
                 ffTrxAttemptClear($pdo, $trxId);
-                $verifiedAmountBdt = (float)($snzRes['amount'] ?? $totalCostBdt);
-                if (!empty($snzRes['sender']) && empty($senderNum)) $senderNum = $snzRes['sender'];
+                $verifiedAmountBdt = (float)($payRes['amount'] ?? $totalCostBdt);
+                if (!empty($payRes['sender']) && empty($senderNum)) $senderNum = $payRes['sender'];
             } else {
-                $failMsg  = $snzRes['message'] ?? 'Transaction verification failed at gateway!';
+                if (!empty($payRes['duplicate'])) {
+                    echo json_encode(['status' => 'error', 'verification_failed' => true, 'message' => $payRes['message']]);
+                    exit;
+                }
+                $failMsg  = $payRes['message'] ?? 'Transaction verification failed at gateway!';
                 $failTry  = ffTrxAttemptFail($pdo, $trxId, (int)$user['id'], $failMsg);
                 if ($failTry <= FF_TRX_MAX_AUTO_TRIES) {
                     echo json_encode([
@@ -1699,11 +1773,11 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_add_fund')
     if ($methodKey === 'usdt') $methodName = 'Binance / USDT Gateway';
     elseif ($methodRow) $methodName = $methodRow['name'];
 
-    $isAutoEnabled = (($settings['auto_payment_on'] ?? '0') === '1') || (($settings['snzpay_auto_verify'] ?? '0') === '1');
+    $isAutoEnabled = skypayAutoOn($settings);
 
     if ($isAutoEnabled) {
-        $gatewayMethod = ($methodKey === 'usdt') ? 'BINANCE' : strtoupper($gatewayKey);
-        $verRes = verifyWithSnzPay($trxId, $gatewayMethod, $amountBdt, $settings);
+        $gatewayMethod = ($methodKey === 'usdt') ? ('usdt ' . $gatewayKey) : $gatewayKey;
+        $verRes = skypayVerifyTrx($settings, $trxId, $gatewayMethod, (float)$amountBdt, (string)($user['username'] ?? 'Customer'), ['user_id' => (int)$user['id'], 'type' => 'deposit']);
         
         if ($verRes['status'] === 'success') {
             ffTrxAttemptClear($pdo, $trxId);
@@ -1731,6 +1805,10 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_add_fund')
                 exit;
             }
         } else {
+            if (!empty($verRes['duplicate'])) {
+                echo json_encode(['status' => 'error', 'message' => $verRes['message']]);
+                exit;
+            }
             $failMsg = $verRes['message'] ?? 'Gateway verification failed!';
             $failTry = ffTrxAttemptFail($pdo, $trxId, (int)$user['id'], $failMsg);
             if ($failTry <= FF_TRX_MAX_AUTO_TRIES) {
@@ -4147,7 +4225,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
 
                 <div class="space-y-1 text-xs">
                     <label class="text-[11px] font-bold text-slate-700 block">Transaction ID (TrxID) <span class="text-rose-500">*</span></label>
-                    <input type="text" id="addFundTrxIdInput" placeholder="SMS TrxID (e.g. 9A8B7C6D)" class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-slate-900 uppercase outline-none focus:border-emerald-500 font-mono shadow-inner">
+                    <input type="text" id="addFundTrxIdInput" placeholder="TrxID / Order ID (e.g. 9A8B7C6D)" class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-slate-900 uppercase outline-none focus:border-emerald-500 font-mono shadow-inner">
                 </div>
 
                 <div id="addFundOrderError" class="hidden p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-600 text-[11px] font-bold text-center"></div>
@@ -4596,7 +4674,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
 
                     <div class="space-y-1 text-xs">
                         <label class="text-[11px] font-bold text-slate-700 block">Transaction ID (TrxID) <span class="text-rose-500">*</span></label>
-                        <input type="text" id="checkoutTrxIdInput" placeholder="Enter SMS TrxID (e.g. 9B8C7A)" class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-slate-900 uppercase font-mono outline-none focus:border-emerald-500 shadow-inner">
+                        <input type="text" id="checkoutTrxIdInput" placeholder="Enter TrxID / Order ID (e.g. 9B8C7A)" class="w-full bg-slate-50 border border-slate-200 p-2.5 rounded-xl text-slate-900 uppercase font-mono outline-none focus:border-emerald-500 shadow-inner">
                     </div>
 
                     <div id="checkoutOrderError" class="hidden p-2 rounded-xl bg-rose-50 border border-rose-200 text-rose-600 text-[11px] font-bold text-center"></div>
