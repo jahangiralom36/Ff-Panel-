@@ -606,6 +606,80 @@ if (!empty($settings['support_channel'])) {
 }
 
 // ====================================================================
+// TRX GUARD: rejected / already-used TrxID block + failed-verify attempt counter
+// ====================================================================
+if (!defined('FF_TRX_MAX_AUTO_TRIES')) define('FF_TRX_MAX_AUTO_TRIES', 2); // after 2 failed tries -> manual admin request
+
+function ffTrxBlockedMessage(PDO $pdo, string $trxId): string {
+    $t = strtoupper(trim($trxId));
+    if ($t === '') return '';
+    try {
+        $st = $pdo->prepare("SELECT LOWER(`status`) FROM `transactions` WHERE UPPER(`trx_id`) IN (?, ?) ORDER BY `id` ASC");
+        $st->execute([$t, 'RFD-' . $t]);
+        $statuses = $st->fetchAll(PDO::FETCH_COLUMN);
+        if ($statuses) {
+            if (array_intersect($statuses, ['rejected', 'declined', 'cancelled', 'canceled', 'failed'])) {
+                return 'This TrxID was rejected by admin and cannot be used again!';
+            }
+            if (array_intersect($statuses, ['pending', 'waiting'])) {
+                return 'This TrxID is already submitted and waiting for admin approval!';
+            }
+            return 'This TrxID has already been used! Fund/Order already completed with this TrxID.';
+        }
+    } catch (Throwable $e) {}
+    try {
+        ffEnsureOrdersTable($pdo);
+        $st = $pdo->prepare("SELECT LOWER(`status`) FROM `pending_orders` WHERE UPPER(`trx_id`) = ? LIMIT 1");
+        $st->execute([$t]);
+        $os = $st->fetchColumn();
+        if ($os !== false) {
+            if ($os === 'rejected') return 'This TrxID was rejected by admin and cannot be used again!';
+            if (in_array($os, ['waiting', 'processing'], true)) return 'This TrxID is already submitted and waiting for approval!';
+            return 'This TrxID has already been used! Fund/Order already completed with this TrxID.';
+        }
+    } catch (Throwable $e) {}
+    return '';
+}
+
+function ffEnsureTrxAttemptsTable(PDO $pdo): void {
+    static $done = false;
+    if ($done) return;
+    try {
+        $pdo->exec("CREATE TABLE IF NOT EXISTS `trx_verify_attempts` (
+            `trx_id` VARCHAR(120) NOT NULL PRIMARY KEY,
+            `user_id` INT NOT NULL DEFAULT 0,
+            `attempts` INT NOT NULL DEFAULT 0,
+            `last_message` VARCHAR(255) NULL,
+            `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+    } catch (Throwable $e) {}
+    $done = true;
+}
+
+// Records one failed gateway verify for this TrxID and returns the total failed tries
+function ffTrxAttemptFail(PDO $pdo, string $trxId, int $userId, string $msg): int {
+    ffEnsureTrxAttemptsTable($pdo);
+    $t = strtoupper(trim($trxId));
+    try {
+        $pdo->prepare("INSERT INTO `trx_verify_attempts` (`trx_id`, `user_id`, `attempts`, `last_message`) VALUES (?, ?, 1, ?)
+                       ON DUPLICATE KEY UPDATE `attempts` = `attempts` + 1, `user_id` = VALUES(`user_id`), `last_message` = VALUES(`last_message`)")
+            ->execute([$t, $userId, mb_substr($msg, 0, 250)]);
+        $st = $pdo->prepare("SELECT `attempts` FROM `trx_verify_attempts` WHERE `trx_id` = ? LIMIT 1");
+        $st->execute([$t]);
+        return (int)$st->fetchColumn();
+    } catch (Throwable $e) {
+        return 1;
+    }
+}
+
+function ffTrxAttemptClear(PDO $pdo, string $trxId): void {
+    try {
+        ffEnsureTrxAttemptsTable($pdo);
+        $pdo->prepare("DELETE FROM `trx_verify_attempts` WHERE `trx_id` = ?")->execute([strtoupper(trim($trxId))]);
+    } catch (Throwable $e) {}
+}
+
+// ====================================================================
 // 4. GATEWAY & EXTERNAL PROVIDER ENGINE
 // ====================================================================
 function verifyWithSnzPay(string $trxId, string $method, float $amountBdt, array $storeSettings): array {
@@ -648,13 +722,17 @@ function verifyWithSnzPay(string $trxId, string $method, float $amountBdt, array
 
     $res = curl_exec($ch);
     $curlErr = curl_error($ch);
+    $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
     if ($curlErr) {
-        return ['status' => 'error', 'message' => 'SkyPay Gateway Timeout: ' . $curlErr];
+        return ['status' => 'error', 'server_error' => true, 'message' => 'Payment server is not responding right now. Please try again.'];
     }
 
     $result = json_decode($res ?: '', true);
+    if (!is_array($result)) {
+        return ['status' => 'error', 'server_error' => true, 'message' => 'Payment server error' . ($httpCode ? ' (HTTP ' . $httpCode . ')' : '') . '. Please try again.'];
+    }
     if ($result && (
         (isset($result['status']) && ($result['status'] === true || $result['status'] === 'success')) ||
         (isset($result['data']['status']) && strtoupper($result['data']['status']) === 'COMPLETED')
@@ -1298,10 +1376,9 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_and_delive
     }
 
     if ($methodKey !== 'wallet') {
-        $stmtChkTrx = $pdo->prepare("SELECT `id` FROM `transactions` WHERE UPPER(`trx_id`) = ? LIMIT 1");
-        $stmtChkTrx->execute([$trxId]);
-        if ($stmtChkTrx->fetch()) {
-            echo json_encode(['status' => 'error', 'message' => 'This Transaction ID (TrxID) has already been used!']);
+        $trxBlockMsg = ffTrxBlockedMessage($pdo, $trxId);
+        if ($trxBlockMsg !== '') {
+            echo json_encode(['status' => 'error', 'message' => $trxBlockMsg]);
             exit;
         }
         ffEnsureOrdersTable($pdo);
@@ -1396,17 +1473,26 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_and_delive
             $snzRes = verifyWithSnzPay($trxId, $gatewayMethod, $totalCostBdt, $settings);
             
             if ($snzRes['status'] === 'success') {
+                ffTrxAttemptClear($pdo, $trxId);
                 $verifiedAmountBdt = (float)($snzRes['amount'] ?? $totalCostBdt);
                 if (!empty($snzRes['sender']) && empty($senderNum)) $senderNum = $snzRes['sender'];
             } else {
-                echo json_encode([
-                    'status'              => 'error',
-                    'verification_failed' => true,
-                    'message'             => $snzRes['message'] ?? 'Transaction verification failed at gateway!'
-                ]);
-                exit;
+                $failMsg  = $snzRes['message'] ?? 'Transaction verification failed at gateway!';
+                $failTry  = ffTrxAttemptFail($pdo, $trxId, (int)$user['id'], $failMsg);
+                if ($failTry <= FF_TRX_MAX_AUTO_TRIES) {
+                    echo json_encode([
+                        'status'              => 'error',
+                        'verification_failed' => true,
+                        'message'             => $failMsg . ' (Try ' . $failTry . '/' . FF_TRX_MAX_AUTO_TRIES . ' — if it fails again, your TrxID will be sent to admin for manual approval.)'
+                    ]);
+                    exit;
+                }
+                // more than 2 failed tries -> send to admin panel as manual request
+                $ffGoManual = true;
             }
-        } else {
+        }
+        if (!$isAutoPaymentEnforced || !empty($ffGoManual)) {
+            if (!empty($ffGoManual)) ffTrxAttemptClear($pdo, $trxId);
             $amountInUsd = round($totalCostBdt / $effectiveBdtRate, 2);
             try {
                 $pdo->prepare("INSERT INTO `transactions` (`user_id`, `method`, `amount`, `bonus_amount`, `sender_num`, `trx_id`, `status`) VALUES (?, ?, ?, 0.00, ?, ?, 'pending')")
@@ -1428,7 +1514,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_and_delive
                 echo json_encode([
                     'status'        => 'pending_submitted',
                     'auto_approved' => false,
-                    'message'       => 'Order submitted! As soon as admin confirms, your key will pop up here automatically (you can also leave this page - key will be saved in My Key).',
+                    'message'       => (!empty($ffGoManual) ? 'Gateway could not verify your TrxID. Your order has been sent to admin for manual approval. ' : '') . 'Order submitted! As soon as admin confirms, your key will pop up here automatically (you can also leave this page - key will be saved in My Key).',
                     'order_id'      => $manualOrderId,
                     'product_name'  => $productFullName,
                     'amount'        => $totalCostBdt
@@ -1596,10 +1682,9 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_add_fund')
         exit;
     }
 
-    $stmtChk = $pdo->prepare("SELECT `id` FROM `transactions` WHERE UPPER(`trx_id`) = ? LIMIT 1");
-    $stmtChk->execute([$trxId]);
-    if ($stmtChk->fetch()) {
-        echo json_encode(['status' => 'error', 'message' => 'This TrxID has already been registered!']);
+    $trxBlockMsg = ffTrxBlockedMessage($pdo, $trxId);
+    if ($trxBlockMsg !== '') {
+        echo json_encode(['status' => 'error', 'message' => $trxBlockMsg]);
         exit;
     }
 
@@ -1621,6 +1706,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_add_fund')
         $verRes = verifyWithSnzPay($trxId, $gatewayMethod, $amountBdt, $settings);
         
         if ($verRes['status'] === 'success') {
+            ffTrxAttemptClear($pdo, $trxId);
             $creditBdt = (float)($verRes['amount'] ?? $amountBdt);
             $creditUsd = round($creditBdt / $effectiveBdtRate, 2);
 
@@ -1645,10 +1731,18 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_add_fund')
                 exit;
             }
         } else {
-            echo json_encode(['status' => 'error', 'message' => $verRes['message'] ?? 'Gateway verification failed!']);
-            exit;
+            $failMsg = $verRes['message'] ?? 'Gateway verification failed!';
+            $failTry = ffTrxAttemptFail($pdo, $trxId, (int)$user['id'], $failMsg);
+            if ($failTry <= FF_TRX_MAX_AUTO_TRIES) {
+                echo json_encode(['status' => 'error', 'message' => $failMsg . ' (Try ' . $failTry . '/' . FF_TRX_MAX_AUTO_TRIES . ' — if it fails again, your TrxID will be sent to admin for manual approval.)']);
+                exit;
+            }
+            // more than 2 failed tries -> send to admin panel as manual deposit request
+            $ffGoManual = true;
+            ffTrxAttemptClear($pdo, $trxId);
         }
-    } else {
+    }
+    if (!$isAutoEnabled || !empty($ffGoManual)) {
         $amountUsd = round($amountBdt / $effectiveBdtRate, 2);
         try {
             $pdo->prepare("INSERT INTO `transactions` (`user_id`, `method`, `amount`, `bonus_amount`, `sender_num`, `trx_id`, `status`) VALUES (?, ?, ?, 0.00, ?, ?, 'pending')")
@@ -1659,7 +1753,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_add_fund')
             echo json_encode([
                 'status'  => 'pending_submitted',
                 'amount'  => number_format($amountBdt, 0),
-                'message' => 'Deposit request of ৳' . number_format($amountBdt, 0) . ' submitted for verification!'
+                'message' => (!empty($ffGoManual) ? 'Gateway could not verify your TrxID. ' : '') . 'Deposit request of ৳' . number_format($amountBdt, 0) . ' submitted to admin for verification!'
             ]);
             exit;
         } catch (Throwable $e) {
