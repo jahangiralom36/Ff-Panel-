@@ -48,6 +48,7 @@ if (isset($_GET['ref']) && !empty($_GET['ref'])) {
 // Session Logout Handler
 if (isset($_GET['logout']) || (isset($_GET['action']) && $_GET['action'] === 'logout')) {
     $_SESSION = [];
+    if (!headers_sent()) setcookie('ff_auth', '', time() - 3600, '/');
     if (ini_get("session.use_cookies")) {
         $params = session_get_cookie_params();
         setcookie(session_name(), '', time() - 42000, $params["path"], $params["domain"], $params["secure"], $params["httponly"]);
@@ -468,6 +469,7 @@ function ffDeliverOrder(PDO $pdo, int $orderId): array {
             // auto-verified direct payment: record the order transaction now
             $pdo->prepare("INSERT INTO `transactions` (`user_id`, `method`, `amount`, `bonus_amount`, `sender_num`, `trx_id`, `status`) VALUES (?, ?, ?, 0.00, ?, ?, 'approved')")
                 ->execute([$userId, 'Direct Order: ' . $o['method_name'], (float)$o['paid_usd'], $o['sender_num'] ?: 'N/A', $o['trx_id']]);
+            ffSetLastTrxBdt($pdo, (float)$o['total_bdt']);
         } elseif (FF_ADMIN_APPROVE_CREDITS_WALLET) {
             // admin approval credited the wallet -> net it out (only if the credit is really there)
             $pdo->prepare("UPDATE `users` SET `balance` = `balance` - ? WHERE `id` = ? AND `balance` >= ?")
@@ -603,6 +605,118 @@ if (!empty($settings['support_channel'])) {
         'sub'   => 'Updates & Giveaways',
         'url'   => $settings['support_channel']
     ];
+}
+
+// ====================================================================
+// EXACT TAKA (BDT) RECORD FOR TRANSACTIONS (history shows the real paid taka)
+// ====================================================================
+function ffEnsureTrxBdtColumn(PDO $pdo): void {
+    static $done = false;
+    if ($done) return;
+    $done = true;
+    $lock = sys_get_temp_dir() . '/ff_schema_trx_bdt_v1.lock';
+    if (file_exists($lock)) return;
+    try {
+        $cols = $pdo->query("SHOW COLUMNS FROM `transactions`")->fetchAll(PDO::FETCH_COLUMN);
+        if (!in_array('amount_bdt', $cols, true)) {
+            $pdo->exec("ALTER TABLE `transactions` ADD COLUMN `amount_bdt` DECIMAL(12,2) NOT NULL DEFAULT 0.00");
+        }
+        @file_put_contents($lock, date('c'));
+    } catch (Throwable $e) {}
+}
+
+// call right after an INSERT INTO `transactions`
+function ffSetLastTrxBdt(PDO $pdo, float $bdt): void {
+    try {
+        $id = (int)$pdo->lastInsertId();
+        if ($id > 0 && $bdt > 0) {
+            $pdo->prepare("UPDATE `transactions` SET `amount_bdt` = ? WHERE `id` = ?")->execute([round($bdt, 2), $id]);
+        }
+    } catch (Throwable $e) {}
+}
+
+// ====================================================================
+// SKYPAY RAW LOG (to check exactly what the gateway returned)
+// ====================================================================
+function ffSkypayLog(PDO $pdo, int $userId, string $trxId, float $typedBdt, array $res): void {
+    try {
+        $pdo->exec("CREATE TABLE IF NOT EXISTS `skypay_logs` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `user_id` INT NOT NULL DEFAULT 0,
+            `trx_id` VARCHAR(120) NOT NULL,
+            `typed_amount` DECIMAL(12,2) NOT NULL DEFAULT 0,
+            `gateway_amount` DECIMAL(12,2) NOT NULL DEFAULT 0,
+            `status` VARCHAR(20) NOT NULL DEFAULT '',
+            `raw_response` TEXT NULL,
+            `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX (`trx_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+        $pdo->prepare("INSERT INTO `skypay_logs` (`user_id`,`trx_id`,`typed_amount`,`gateway_amount`,`status`,`raw_response`) VALUES (?,?,?,?,?,?)")
+            ->execute([$userId, strtoupper($trxId), $typedBdt, (float)($res['amount'] ?? 0), (string)($res['status'] ?? ''), mb_substr((string)($res['raw'] ?? ''), 0, 60000)]);
+    } catch (Throwable $e) {}
+}
+
+// ====================================================================
+// REMEMBER LOGIN (signed cookie, keeps user logged in for many hours)
+// ====================================================================
+if (!defined('FF_REMEMBER_HOURS')) define('FF_REMEMBER_HOURS', 72);
+
+function ffRememberSecret(PDO $pdo): string {
+    static $sec = null;
+    if ($sec !== null) return $sec;
+    try {
+        $st = $pdo->prepare("SELECT `setting_value` FROM `system_settings` WHERE `setting_key` = 'remember_secret' LIMIT 1");
+        $st->execute();
+        $v = (string)$st->fetchColumn();
+        if (strlen($v) < 32) {
+            $v = bin2hex(random_bytes(32));
+            $pdo->prepare("INSERT INTO `system_settings` (`setting_key`, `setting_value`) VALUES ('remember_secret', ?) ON DUPLICATE KEY UPDATE `setting_value` = `setting_value`")->execute([$v]);
+            $st->execute();
+            $saved = (string)$st->fetchColumn();
+            if (strlen($saved) >= 32) $v = $saved;
+        }
+        $sec = $v;
+    } catch (Throwable $e) {
+        $sec = hash('sha256', __FILE__ . (defined('DB_PASS') ? DB_PASS : '') . (defined('DB_NAME') ? DB_NAME : ''));
+    }
+    return $sec;
+}
+
+function ffRememberSign(PDO $pdo, int $uid, int $exp, string $passHash): string {
+    return hash_hmac('sha256', $uid . '|' . $exp . '|' . $passHash, ffRememberSecret($pdo));
+}
+
+function ffRememberSet(PDO $pdo, array $u): void {
+    if (headers_sent()) return;
+    $uid = (int)$u['id'];
+    $exp = time() + FF_REMEMBER_HOURS * 3600;
+    $val = $uid . '.' . $exp . '.' . ffRememberSign($pdo, $uid, $exp, (string)($u['password'] ?? ''));
+    $secure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+    setcookie('ff_auth', $val, ['expires' => $exp, 'path' => '/', 'secure' => $secure, 'httponly' => true, 'samesite' => 'Lax']);
+    $_COOKIE['ff_auth'] = $val;
+}
+
+function ffRememberClear(): void {
+    if (!headers_sent()) setcookie('ff_auth', '', ['expires' => time() - 3600, 'path' => '/', 'httponly' => true, 'samesite' => 'Lax']);
+    unset($_COOKIE['ff_auth']);
+}
+
+// returns user id from a valid remember cookie, or 0
+function ffRememberCheck(PDO $pdo): int {
+    $c = (string)($_COOKIE['ff_auth'] ?? '');
+    if (!preg_match('/^(\d+)\.(\d+)\.([a-f0-9]{64})$/', $c, $m)) return 0;
+    $uid = (int)$m[1]; $exp = (int)$m[2];
+    if ($uid <= 0 || $exp < time()) return 0;
+    try {
+        $st = $pdo->prepare("SELECT `password`, `status` FROM `users` WHERE `id` = ? LIMIT 1");
+        $st->execute([$uid]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        if (!$row || ($row['status'] ?? 'active') !== 'active') return 0;
+        if (!hash_equals(ffRememberSign($pdo, $uid, $exp, (string)$row['password']), $m[3])) return 0;
+        return $uid;
+    } catch (Throwable $e) {
+        return 0;
+    }
 }
 
 // ====================================================================
@@ -793,9 +907,20 @@ if (!function_exists('skypayVerifyTrx')) {
                 $d  = is_array($j['data'] ?? null) ? $j['data'] : [];
                 $st = strtoupper((string)($d['status'] ?? 'COMPLETED'));
                 if ($st === 'COMPLETED' || $st === 'SUCCESS' || $st === 'PAID') {
-                    $paid = (float)($d['amount'] ?? 0);
+                    // prefer the real received amount (from SMS) if SkyPay sends it
+                    $paid = 0.0;
+                    foreach (['received_amount', 'paid_amount', 'sms_amount', 'actual_amount', 'trx_amount', 'transaction_amount', 'amount'] as $ak) {
+                        if (isset($d[$ak]) && is_numeric($d[$ak]) && (float)$d[$ak] > 0) { $paid = (float)$d[$ak]; break; }
+                    }
+                    foreach (['sms', 'sms_body', 'message_body', 'body', 'text'] as $sk) {
+                        if (!empty($d[$sk]) && is_string($d[$sk]) && preg_match('/(?:Tk|BDT|৳)\s*([0-9][0-9,]*(?:\.[0-9]+)?)/iu', $d[$sk], $mm)) {
+                            $smsAmt = (float)str_replace(',', '', $mm[1]);
+                            if ($smsAmt > 0) { $paid = $smsAmt; break; }
+                        }
+                    }
                     return [
                         'status'  => 'success',
+                        'raw'     => json_encode($j, JSON_UNESCAPED_UNICODE),
                         'amount'  => $paid > 0 ? $paid : $amountBdt,
                         'sender'  => (string)($d['sender'] ?? ($d['mobile_number'] ?? '')),
                         'trx_id'  => (string)($d['transaction_id'] ?? $trx),
@@ -811,13 +936,14 @@ if (!function_exists('skypayVerifyTrx')) {
 
         $j   = $v['json'];
         $msg = is_array($j) ? (string)($j['message'] ?? '') : '';
+        $raw = is_array($j) ? json_encode($j, JSON_UNESCAPED_UNICODE) : ('HTTP ' . $v['http'] . ' ' . $v['err']);
         if ($v['err'] !== '' || $j === null || $v['http'] >= 500) {
-            return ['status' => 'error', 'server_error' => true, 'message' => 'Payment server is not responding right now. Please try again.'];
+            return ['status' => 'error', 'server_error' => true, 'raw' => $raw, 'message' => 'Payment server is not responding right now. Please try again.'];
         }
         if ($v['http'] === 400 && stripos($msg, 'already') !== false) {
-            return ['status' => 'error', 'duplicate' => true, 'message' => 'This TrxID has already been used!'];
+            return ['status' => 'error', 'duplicate' => true, 'raw' => $raw, 'message' => 'This TrxID has already been used!'];
         }
-        return ['status' => 'error', 'message' => $msg !== '' ? $msg : 'Transaction ID not found. Please check your TrxID and try again.'];
+        return ['status' => 'error', 'raw' => $raw, 'message' => $msg !== '' ? $msg : 'Transaction ID not found. Please check your TrxID and try again.'];
     }
 }
 
@@ -1200,6 +1326,20 @@ $userId     = (int)($_SESSION['auth_user_id'] ?? $_SESSION['user_id'] ?? 0);
 $user       = null;
 $isLoggedIn = false;
 
+ffEnsureTrxBdtColumn($pdo); // adds `amount_bdt` once (runs outside any DB transaction)
+
+// session expired on the server? -> restore login from the signed remember cookie
+if ($userId <= 0) {
+    $rememberUid = ffRememberCheck($pdo);
+    if ($rememberUid > 0) {
+        $userId = $rememberUid;
+        $_SESSION['auth_user_id'] = $rememberUid;
+        $_SESSION['user_id']      = $rememberUid;
+    } elseif (isset($_COOKIE['ff_auth'])) {
+        ffRememberClear();
+    }
+}
+
 if ($userId > 0) {
     try {
         $stmt = $pdo->prepare("SELECT * FROM `users` WHERE `id` = ? LIMIT 1");
@@ -1216,7 +1356,14 @@ if ($userId > 0) {
             }
             $user       = $fetchedUser;
             $isLoggedIn = true;
+            if (empty($_SESSION['auth_username'])) $_SESSION['auth_username'] = $fetchedUser['username'] ?? '';
+            // keep login alive: (re)issue remember cookie when missing, invalid, or older than 1 hour
+            $rcParts = explode('.', (string)($_COOKIE['ff_auth'] ?? ''));
+            if (count($rcParts) !== 3 || ((int)$rcParts[1] - time()) < (FF_REMEMBER_HOURS * 3600 - 3600) || ffRememberCheck($pdo) !== (int)$fetchedUser['id']) {
+                ffRememberSet($pdo, $fetchedUser);
+            }
         } else {
+            ffRememberClear();
             unset($_SESSION['auth_user_id'], $_SESSION['user_id'], $_SESSION['auth_username']);
             $userId = 0;
         }
@@ -1541,6 +1688,11 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_and_delive
         if ($isAutoPaymentEnforced) {
             $gatewayMethod = ($methodKey === 'usdt') ? ('usdt ' . $gatewayKey) : $gatewayKey;
             $payRes = skypayVerifyTrx($settings, $trxId, $gatewayMethod, (float)$totalCostBdt, (string)($user['username'] ?? 'Customer'), ['user_id' => (int)$user['id'], 'type' => 'order', 'plan_id' => $planId]);
+            ffSkypayLog($pdo, (int)$user['id'], $trxId, (float)$totalCostBdt, $payRes);
+            // paid less than the price? -> do not deliver
+            if ($payRes['status'] === 'success' && (float)($payRes['amount'] ?? 0) > 0 && (float)$payRes['amount'] + 0.5 < (float)$totalCostBdt) {
+                $payRes = ['status' => 'error', 'message' => 'Paid amount ৳' . number_format((float)$payRes['amount'], 0) . ' is less than the price ৳' . number_format((float)$totalCostBdt, 0) . '. Please contact support.'];
+            }
             
             if ($payRes['status'] === 'success') {
                 ffTrxAttemptClear($pdo, $trxId);
@@ -1571,6 +1723,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_and_delive
             try {
                 $pdo->prepare("INSERT INTO `transactions` (`user_id`, `method`, `amount`, `bonus_amount`, `sender_num`, `trx_id`, `status`) VALUES (?, ?, ?, 0.00, ?, ?, 'pending')")
                     ->execute([$user['id'], $methodDisplayName . ' (Manual Order)', $amountInUsd, $senderNum ?: 'N/A', $trxId]);
+                ffSetLastTrxBdt($pdo, (float)$totalCostBdt);
 
                 // Save full order so key can be auto-delivered the moment admin approves
                 $manualOrderId = ffCreateOrder($pdo, [
@@ -1693,12 +1846,14 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_and_delive
             
             $pdo->prepare("INSERT INTO `transactions` (`user_id`, `method`, `amount`, `bonus_amount`, `sender_num`, `trx_id`, `status`) VALUES (?, 'Wallet Purchase', ?, 0.00, 'Wallet', ?, 'approved')")
                 ->execute([$user['id'], $totalCostUsd, 'WLT-' . strtoupper(uniqid())]);
+            ffSetLastTrxBdt($pdo, (float)$totalCostBdt);
         } else {
             // ২. ডাইরেক্ট পেমেন্ট: ওয়ালেটে ১ টাকাও যোগ হবে না, শুধু অর্ডার ট্রানজেকশন রেকর্ড হবে
             $amountInUsd = round($verifiedAmountBdt / $effectiveBdtRate, 2);
             $orderMethodTitle = 'Direct Order: ' . $methodDisplayName;
             $pdo->prepare("INSERT INTO `transactions` (`user_id`, `method`, `amount`, `bonus_amount`, `sender_num`, `trx_id`, `status`) VALUES (?, ?, ?, 0.00, ?, ?, 'approved')")
                 ->execute([$user['id'], $orderMethodTitle, $amountInUsd, $senderNum ?: 'N/A', $trxId]);
+            ffSetLastTrxBdt($pdo, (float)$verifiedAmountBdt);
 
             if ($totalRewardCoins > 0) {
                 $pdo->prepare("UPDATE `users` SET `coins` = `coins` + ? WHERE `id` = ?")->execute([$totalRewardCoins, $user['id']]);
@@ -1779,9 +1934,12 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_add_fund')
         $gatewayMethod = ($methodKey === 'usdt') ? ('usdt ' . $gatewayKey) : $gatewayKey;
         $verRes = skypayVerifyTrx($settings, $trxId, $gatewayMethod, (float)$amountBdt, (string)($user['username'] ?? 'Customer'), ['user_id' => (int)$user['id'], 'type' => 'deposit']);
         
+        ffSkypayLog($pdo, (int)$user['id'], $trxId, (float)$amountBdt, $verRes);
         if ($verRes['status'] === 'success') {
             ffTrxAttemptClear($pdo, $trxId);
-            $creditBdt = (float)($verRes['amount'] ?? $amountBdt);
+            // credit only the real received taka (never more than what the user typed)
+            $gwAmount  = (float)($verRes['amount'] ?? 0);
+            $creditBdt = ($gwAmount > 0) ? min($gwAmount, (float)$amountBdt) : (float)$amountBdt;
             $creditUsd = round($creditBdt / $effectiveBdtRate, 2);
 
             $pdo->beginTransaction();
@@ -1789,6 +1947,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_add_fund')
                 $pdo->prepare("UPDATE `users` SET `balance` = `balance` + ? WHERE `id` = ?")->execute([$creditUsd, $user['id']]);
                 $pdo->prepare("INSERT INTO `transactions` (`user_id`, `method`, `amount`, `bonus_amount`, `sender_num`, `trx_id`, `status`) VALUES (?, ?, ?, 0.00, ?, ?, 'approved')")
                     ->execute([$user['id'], $methodName, $creditUsd, $verRes['sender'] ?: 'Auto Verified', $trxId]);
+                ffSetLastTrxBdt($pdo, (float)$creditBdt);
                 $pdo->commit();
 
                 recordLiveActivity($pdo, $user['username'], 'deposit', 'Added funds via ' . $methodName, $creditBdt);
@@ -1825,6 +1984,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_add_fund')
         try {
             $pdo->prepare("INSERT INTO `transactions` (`user_id`, `method`, `amount`, `bonus_amount`, `sender_num`, `trx_id`, `status`) VALUES (?, ?, ?, 0.00, ?, ?, 'pending')")
                 ->execute([$user['id'], $methodName, $amountUsd, $senderNum ?: 'N/A', $trxId]);
+            ffSetLastTrxBdt($pdo, (float)$amountBdt);
 
             recordLiveActivity($pdo, $user['username'], 'deposit', 'Deposit Request (' . $methodName . ')', $amountBdt);
 
@@ -3810,7 +3970,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
                                 </div>
                                 <div class="flex justify-between items-center pt-1 border-t border-slate-200 text-[11px] font-mono">
                                     <span class="text-slate-500">TrxID: <b class="text-slate-700"><?= htmlspecialchars($d['trx_id'] ?? 'N/A') ?></b></span>
-                                    <span class="font-black text-slate-900">৳<?= number_format((float)($d['amount'] ?? 0) * $effectiveBdtRate, 0) ?></span>
+                                    <span class="font-black text-slate-900">৳<?= number_format(((float)($d['amount_bdt'] ?? 0) > 0) ? (float)$d['amount_bdt'] : ((float)($d['amount'] ?? 0) * $effectiveBdtRate), 0) ?></span>
                                 </div>
                             </div>
                         <?php endforeach; ?>
