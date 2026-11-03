@@ -34,6 +34,7 @@ UPDATE `product_plans` SET `regular_price` = `user_price` WHERE `regular_price` 
 
 -- ---------- product maintenance notice ----------
 CALL ff_add_col('products', 'maintenance_message', 'TEXT NULL');
+CALL ff_add_col('products', 'maintenance_link', 'VARCHAR(500) NULL');
 
 -- ---------- exact taka in transaction history ----------
 CALL ff_add_col('transactions', 'amount_bdt', 'DECIMAL(12,2) NOT NULL DEFAULT 0.00');

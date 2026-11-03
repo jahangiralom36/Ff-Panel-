@@ -164,6 +164,9 @@ try {
     if (!in_array('maintenance_message', $prodCols)) {
         $pdo->exec("ALTER TABLE `products` ADD COLUMN `maintenance_message` TEXT NULL");
     }
+    if (!in_array('maintenance_link', $prodCols)) {
+        $pdo->exec("ALTER TABLE `products` ADD COLUMN `maintenance_link` VARCHAR(500) NULL");
+    }
 } catch (Throwable $e) {}
 
 // ====================================================================
@@ -1086,6 +1089,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_action'])) {
         $tags           = trim($_POST['tags'] ?? '');
         $description    = trim($_POST['description'] ?? '');
         $maintMessage   = trim($_POST['maintenance_message'] ?? '');
+        $maintLink      = trim($_POST['maintenance_link'] ?? '');
 
         $curr = $pdo->query("SELECT * FROM products WHERE id = $prodId")->fetch();
         $logoUrl   = $curr['logo_url'] ?? null;
@@ -1108,6 +1112,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_action'])) {
 
         $pdo->prepare("UPDATE products SET name = ?, sort_order = ?, image_url = ?, banner_url = ?, logo_url = ?, download_link = ?, setup_link = ?, app_download_url = ?, description = ?, tags = ?, category = ?, is_pinned = ?, is_active = ?, maintenance_message = ? WHERE id = ?")
             ->execute([$name, $sortOrder, $bannerUrl, $bannerUrl, $logoUrl, $downloadLink, $setupLink, $appDownloadUrl, $description, $tags, $category, $isPinned, $isActive, $maintMessage, $prodId]);
+        try {
+            $pdo->prepare("UPDATE products SET maintenance_link = ? WHERE id = ?")->execute([$maintLink, $prodId]);
+        } catch (Throwable $e) {}
 
         if (!empty($_POST['plan_user_price']) && is_array($_POST['plan_user_price'])) {
             $upPlan = $pdo->prepare("UPDATE product_plans SET user_price = ?, regular_price = ?, reseller_price = ?, is_out_of_stock = ? WHERE id = ? AND product_id = ?");
@@ -4727,6 +4734,10 @@ $providerBalance = km_get_cached_provider_balance($pdo);
                     <label class="text-[10px] font-bold text-rose-600 uppercase block mb-1">Product Maintenance Notice &amp; Rules (মেইনটেন্যান্স রুলস)</label>
                     <textarea id="editModalMaintRules" name="maintenance_message" rows="3" placeholder="⚠️ Rules & Conditions:&#10;এই প্রোডাক্টটির সার্ভার আপগ্রেড চলছে..." class="w-full bg-rose-50/60 border border-rose-200 p-2.5 rounded-xl text-slate-900 outline-none font-sans text-xs focus:border-rose-500"></textarea>
                 </div>
+                <div>
+                    <label class="text-[10px] font-bold text-rose-600 uppercase block mb-1">Maintenance Telegram Link (মেইনটেন্যান্স টেলিগ্রাম চ্যানেল লিংক)</label>
+                    <input type="text" id="editModalMaintLink" name="maintenance_link" placeholder="https://t.me/your_channel" class="w-full bg-rose-50/60 border border-rose-200 p-2.5 rounded-xl text-slate-900 outline-none font-mono text-xs">
+                    <span class="text-[9px] text-slate-400">Product maintenance-e thakle popup-er button ei link-e jabe. Khali rakhle Support Telegram link use hobe.</span></div>
 
                 <!-- Plans List in Editor (Removed Coins) -->
                 <div class="space-y-2 pt-2 border-t border-slate-100">
@@ -5408,6 +5419,8 @@ $providerBalance = km_get_cached_provider_balance($pdo);
 
             const maintInput = document.getElementById('editModalMaintRules');
             if (maintInput) maintInput.value = prod.maintenance_message || '';
+            const maintLinkInput = document.getElementById('editModalMaintLink');
+            if (maintLinkInput) maintLinkInput.value = prod.maintenance_link || '';
 
             document.getElementById('editModalIsPinned').checked = (parseInt(prod.is_pinned) === 1);
 
