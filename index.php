@@ -27,6 +27,12 @@ error_reporting(E_ALL);
 header("X-Content-Type-Options: nosniff");
 header("X-Frame-Options: SAMEORIGIN");
 header("X-XSS-Protection: 1; mode=block");
+// Always serve fresh page (admin price / plan changes show instantly, no stale browser/host cache)
+header("Cache-Control: no-store, no-cache, must-revalidate, max-age=0");
+header("Cache-Control: post-check=0, pre-check=0", false);
+header("Pragma: no-cache");
+header("Expires: Mon, 26 Jul 1997 05:00:00 GMT");
+header("X-LiteSpeed-Cache-Control: no-cache");
 
 require_once __DIR__ . '/config.php';
 
@@ -4271,8 +4277,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
                                         $totalSpentUsd += $d['amount'];
                                     }
                                 }
-                                echo number_format($totalSpentUsd * $effectiveBdtRate, 0);
-                            ?><span class="text-sm">৳</span>
+                            ?><span class="price-display" data-bdt="<?= round($totalSpentUsd * $effectiveBdtRate, 0) ?>" data-usdt="<?= round($totalSpentUsd, 2) ?>"><?= number_format($totalSpentUsd * $effectiveBdtRate, 0) ?>৳</span>
                         </span>
                         <span class="text-[10px] font-bold text-slate-400 uppercase mt-1 block">Total Spent</span>
                     </div>
@@ -4825,7 +4830,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
                 <div id="checkoutSectionWallet" class="space-y-3">
                     <div class="bg-slate-50 border border-slate-200 p-3 rounded-2xl space-y-1">
                         <span class="text-[10px] text-slate-500 block uppercase">Available Balance:</span>
-                        <strong class="text-lg font-black text-slate-900 font-mono"><span id="walletCheckoutBalance"><?= number_format($userBalanceBdt, 0) ?></span>৳</strong>
+                        <strong class="text-lg font-black text-slate-900 font-mono"><span id="walletCheckoutBalance"><?= number_format($userBalanceBdt, 0) ?></span><span id="walletCheckoutSymbol">৳</span></strong>
                     </div>
                     <div class="bg-amber-50 border border-amber-200 p-3 rounded-2xl flex items-center justify-between">
                         <span class="text-[10px] text-amber-700 font-bold uppercase">Total to Pay</span>
@@ -5217,7 +5222,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
 
         function setCurrency(cur) {
             currentCurrency = cur;
-            localStorage.setItem('selected_currency', cur);
+            try { localStorage.setItem('selected_currency', cur); } catch (e) {}
             
             const btnBDT = document.getElementById('btnCurrencyBDT');
             const btnUSDT = document.getElementById('btnCurrencyUSDT');
@@ -5263,10 +5268,20 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
                 }
             }
 
+            const wcBal = document.getElementById('walletCheckoutBalance');
+            const wcSym = document.getElementById('walletCheckoutSymbol');
+            if (wcBal) {
+                wcBal.textContent = currentCurrency === 'BDT' ? Math.round(currentUserBalanceBdt).toLocaleString() : Number(currentUserBalanceUsdt).toFixed(2);
+                if (wcSym) wcSym.textContent = currentCurrency === 'BDT' ? '৳' : '$';
+            }
+
             if (activeSelectedPlan) {
                 updatePlanPriceDisplay(activeSelectedPlan);
             }
         }
+
+        // page restored from back/forward cache -> reload so prices & balance are fresh
+        window.addEventListener('pageshow', function (e) { if (e.persisted) window.location.reload(); });
 
         function openNotificationsModal() { document.getElementById('notificationsModal').classList.remove('hidden'); }
         function closeNotificationsModal() { document.getElementById('notificationsModal').classList.add('hidden'); }
@@ -6044,6 +6059,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
                         updateAllCurrencyDisplays();
                         const wc = document.getElementById('walletCheckoutBalance');
                         if (wc) wc.textContent = Math.round(currentUserBalanceBdt).toLocaleString();
+                        try { updateAllCurrencyDisplays(); } catch (e) {}
                     }
                     await refreshCoinData();
                 } else {
@@ -6623,7 +6639,8 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
 
         // DOM ready
         window.addEventListener('DOMContentLoaded', () => {
-            const savedCurrency = localStorage.getItem('selected_currency');
+            let savedCurrency = null;
+            try { savedCurrency = localStorage.getItem('selected_currency'); } catch (e) {}
             if (savedCurrency && (savedCurrency === 'BDT' || savedCurrency === 'USDT')) {
                 currentCurrency = savedCurrency;
                 const textLabel = document.getElementById('currencyTextLabel');
