@@ -1408,12 +1408,17 @@ $userBalanceUsdt  = (float)$user['balance'];
 $userCustomPrices    = [];
 $userAllowedProducts = [];
 
-if ($isLoggedIn && $userRole === 'reseller') {
+// Admin custom prices work for BOTH customers and resellers
+if ($isLoggedIn) {
     try {
         $stmtUCP = $pdo->prepare("SELECT `plan_id`, `custom_price` FROM `user_custom_prices` WHERE `user_id` = ?");
         $stmtUCP->execute([$user['id']]);
         $userCustomPrices = $stmtUCP->fetchAll(PDO::FETCH_KEY_PAIR);
+    } catch (Throwable $e) {}
+}
 
+if ($isLoggedIn && $userRole === 'reseller') {
+    try {
         if ((int)($user['is_product_restricted'] ?? 0) === 1) {
             $stmtUAP = $pdo->prepare("SELECT `product_id` FROM `user_allowed_products` WHERE `user_id` = ?");
             $stmtUAP->execute([$user['id']]);
