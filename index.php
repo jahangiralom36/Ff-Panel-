@@ -3659,7 +3659,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
                                 <div class="maintenance-badge">Maintenance</div>
                             <?php endif; ?>
 
-                            <div class="w-full h-28 sm:h-36 rounded-xl bg-slate-900 border border-slate-200 overflow-hidden relative flex items-center justify-center shadow-inner cursor-pointer img-skeleton" onclick="<?= $isProdMaint ? "showProductMaintenancePopup('" . addslashes(htmlspecialchars($prod['maintenance_msg'])) . "')" : "openProductModal({$prod['id']})" ?>">
+                            <div class="w-full h-28 sm:h-36 rounded-xl bg-slate-900 border border-slate-200 overflow-hidden relative flex items-center justify-center shadow-inner cursor-pointer img-skeleton" onclick="<?= $isProdMaint ? ('showProductMaintenancePopup(' . htmlspecialchars(json_encode((string)$prod['maintenance_msg'], JSON_UNESCAPED_UNICODE), ENT_QUOTES) . ', ' . htmlspecialchars(json_encode((string)$prod['name'], JSON_UNESCAPED_UNICODE), ENT_QUOTES) . ')') : "openProductModal({$prod['id']})" ?>">
                 <?php if (!empty($bannerImg)): ?>
                     <img src="<?= htmlspecialchars($bannerImg) ?>" loading="lazy" decoding="async" alt="<?= htmlspecialchars($prod['name']) ?>" class="w-full h-full object-cover">
                 <?php else: ?>
@@ -3680,7 +3680,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
                 </span>
             </div>
 
-            <div class="text-center space-y-0.5 cursor-pointer" onclick="<?= $isProdMaint ? "showProductMaintenancePopup('" . addslashes(htmlspecialchars($prod['maintenance_msg'])) . "')" : "openProductModal({$prod['id']})" ?>">
+            <div class="text-center space-y-0.5 cursor-pointer" onclick="<?= $isProdMaint ? ('showProductMaintenancePopup(' . htmlspecialchars(json_encode((string)$prod['maintenance_msg'], JSON_UNESCAPED_UNICODE), ENT_QUOTES) . ', ' . htmlspecialchars(json_encode((string)$prod['name'], JSON_UNESCAPED_UNICODE), ENT_QUOTES) . ')') : "openProductModal({$prod['id']})" ?>">
                 <h3 class="font-black text-slate-800 text-[11px] sm:text-xs truncate uppercase leading-tight">
                     <?= htmlspecialchars($prod['name']) ?>
                 </h3>
@@ -3699,7 +3699,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
 
                             <div class="pt-1">
                                 <?php if ($isProdMaint): ?>
-                                    <button type="button" onclick="showProductMaintenancePopup('<?= addslashes(htmlspecialchars($prod['maintenance_msg'])) ?>', '<?= addslashes(htmlspecialchars($prod['name'])) ?>')" class="w-full py-1.5 rounded-xl bg-rose-100 border border-rose-300 text-rose-600 font-black text-[10px] uppercase shadow-sm active:scale-95 transition">
+                                    <button type="button" onclick="showProductMaintenancePopup(<?= htmlspecialchars(json_encode((string)$prod['maintenance_msg'], JSON_UNESCAPED_UNICODE), ENT_QUOTES) ?>, <?= htmlspecialchars(json_encode((string)$prod['name'], JSON_UNESCAPED_UNICODE), ENT_QUOTES) ?>)" class="w-full py-1.5 rounded-xl bg-rose-100 border border-rose-300 text-rose-600 font-black text-[10px] uppercase shadow-sm active:scale-95 transition">
                                         Maintenance
                                     </button>
                                 <?php else: ?>
@@ -5254,7 +5254,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
         function openNotificationsModal() { document.getElementById('notificationsModal').classList.remove('hidden'); }
         function closeNotificationsModal() { document.getElementById('notificationsModal').classList.add('hidden'); }
         function openEditProfileModal() { document.getElementById('editProfileModal').classList.remove('hidden'); }
-        function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
+        function closeModal(id) { const el = document.getElementById(id); if (!el) return; el.classList.add('hidden'); el.style.display = ''; }
 
         function showProductMaintenancePopup(msg, prodName) {
             const nameEl = document.getElementById('maintPopupProdName');
@@ -5406,7 +5406,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
             
             // মেইনটেন্যান্স চেক ১০০% লক করা হলো
             if (!prod.is_active || prod.is_active === 0 || prod.is_active === '0' || prod.is_active === false) {
-                showProductMaintenancePopup(prod.maintenance_msg || 'This product is currently under maintenance. Please check back later.');
+                showProductMaintenancePopup(prod.maintenance_msg || 'This product is currently under maintenance. Please check back later.', prod.name || '');
                 return;
             }
 
@@ -6652,6 +6652,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
     <!-- =============================================================== -->
     <!-- DYNAMIC WELCOME POPUP (1-HOUR REPEAT & ADMIN CONNECTED)         -->
     <!-- =============================================================== -->
+    <?php if (($settings['update_channel_popup_enabled'] ?? '0') === '1'): ?>
     <?php
         $popTitle = !empty($settings['update_channel_title']) ? $settings['update_channel_title'] : ('স্বাগতম ' . htmlspecialchars($storeTitleName) . '-এ! 🎉');
         $popMsg   = !empty($settings['update_channel_msg']) ? $settings['update_channel_msg'] : 'নতুন সব পাস, ফ্রি গিভঅ্যাওয়ে, আপডেট ও ইনস্ট্যান্ট সাপোর্টের জন্য এখনই আমাদের অফিসিয়াল টেলিগ্রাম চ্যানেলে জয়েন করুন!';
@@ -6737,15 +6738,17 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
             }, 300);
 
             // ব্রাউজার সম্পূর্ণ বন্ধ না করা পর্যন্ত এই সেশনে আর বিরক্ত করবে না
-            sessionStorage.setItem('welcome_popup_session_done', '1');
+            try { sessionStorage.setItem('welcome_popup_session_done', '1'); } catch (e) {}
         }
 
         // সাইটে নতুন ভিজিট করলেই স্বয়ংক্রিয়ভাবে পপআপ চালু হবে
         function verifyAndTriggerWelcomePopup() {
             // পুরনো ১ ঘণ্টার লক ক্লিয়ার
-            localStorage.removeItem('welcome_popup_last_shown');
+            try { localStorage.removeItem('welcome_popup_last_shown'); } catch (e) {}
 
-            if (!sessionStorage.getItem('welcome_popup_session_done')) {
+            var done = false;
+            try { done = !!sessionStorage.getItem('welcome_popup_session_done'); } catch (e) {}
+            if (!done) {
                 setTimeout(openWelcomeTgModal, 600);
             }
         }
@@ -6756,5 +6759,6 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
             verifyAndTriggerWelcomePopup();
         }
     </script>
+    <?php endif; ?>
 </body>
 </html>
