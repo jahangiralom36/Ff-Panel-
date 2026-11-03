@@ -5456,6 +5456,7 @@ $providerBalance = km_get_cached_provider_balance($pdo);
                                 <label class="text-[9px] text-slate-500 block font-bold">Price ($ USD)</label>
                                 <input type="number" step="0.01" name="plan_user_price[${pl.id}]" value="${custBase.toFixed(2)}" class="w-full bg-slate-50 border border-slate-200 p-1.5 rounded-lg text-emerald-700 font-mono font-bold text-xs outline-none">
                                 <span class="text-[9px] text-slate-400 font-mono">≈ ৳${bdt} BDT</span>
+                                ${parseFloat(pl.discount_percent || 0) > 0 ? `<span class="block text-[9px] text-rose-600 font-bold">-${parseFloat(pl.discount_percent)}% discount ON → customer pays $${(custBase * (1 - parseFloat(pl.discount_percent) / 100)).toFixed(2)} (≈ ৳${Math.round(custBase * (1 - parseFloat(pl.discount_percent) / 100) * currentBdtRate)})</span>` : ''}
                             </div>
                             <div>
                                 <label class="text-[9px] text-slate-500 block font-bold">Wholesale Reseller Price</label>
