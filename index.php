@@ -720,6 +720,18 @@ function ffRememberCheck(PDO $pdo): int {
 }
 
 // ====================================================================
+// CUSTOMER PLAN PRICE: admin edits always apply. When a plan discount is on,
+// user_price already holds the discounted price, so start from regular_price
+// (the discount is applied once, later).
+// ====================================================================
+function ffCustomerBasePrice(array $pl): float {
+    $user = (float)($pl['user_price'] ?? 0);
+    $reg  = (float)($pl['regular_price'] ?? 0);
+    $disc = (float)($pl['discount_percent'] ?? 0);
+    return ($disc > 0 && $reg > 0) ? $reg : $user;
+}
+
+// ====================================================================
 // TRX GUARD: rejected / already-used TrxID block + failed-verify attempt counter
 // ====================================================================
 if (!defined('FF_TRX_MAX_AUTO_TRIES')) define('FF_TRX_MAX_AUTO_TRIES', 2); // after 2 failed tries -> manual admin request
@@ -1631,7 +1643,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_and_delive
 
     $stmt = $pdo->prepare("SELECT p.id as real_product_id, p.name as product_name, p.is_active, p.logo_url, p.image_url,
                                   COALESCE(NULLIF(pl.plan_title, ''), NULLIF(pl.validity, ''), 'Standard Plan') as plan_title,
-                                  pl.reseller_price, pl.user_price, pl.price,
+                                  pl.reseller_price, pl.user_price, pl.price, pl.regular_price,
                                   pl.reseller_discount_percent, COALESCE(pl.discount_percent, 0) as discount_percent,
                                   pl.api_plan_id, pl.reward_coins, pl.coin_price 
                            FROM `product_plans` pl 
@@ -1649,7 +1661,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_and_delive
     $rewardCoinsPerItem = max(0, (int)($plan['reward_coins'] ?? 0));
     $totalRewardCoins   = $rewardCoinsPerItem * $quantity;
 
-    $rawRetailPrice = (float)(($plan['user_price'] ?? 0) ?: (($plan['price'] ?? 0) ?: ($plan['reseller_price'] ?? 0)));
+    $rawRetailPrice = (float)(ffCustomerBasePrice($plan) ?: (($plan['price'] ?? 0) ?: ($plan['reseller_price'] ?? 0)));
     $rawResellPrice = (float)(($plan['reseller_price'] ?? 0) ?: (($plan['price'] ?? 0) ?: ($plan['user_price'] ?? 0)));
     $basePrice      = ($userRole === 'reseller') ? ($rawResellPrice > 0 ? $rawResellPrice : $rawRetailPrice) : ($rawRetailPrice > 0 ? $rawRetailPrice : $rawResellPrice);
 
@@ -2041,7 +2053,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'live_generate') {
 
     $stmt = $pdo->prepare("SELECT p.id as real_product_id, p.name as product_name, p.is_active, 
                                   COALESCE(NULLIF(pl.plan_title, ''), NULLIF(pl.validity, ''), 'Standard Plan') as plan_title,
-                                  pl.reseller_price, pl.user_price, pl.price,
+                                  pl.reseller_price, pl.user_price, pl.price, pl.regular_price,
                                   pl.reseller_discount_percent, COALESCE(pl.discount_percent, 0) as discount_percent,
                                   pl.api_plan_id, pl.reward_coins, pl.coin_price 
                            FROM `product_plans` pl 
@@ -2062,7 +2074,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'live_generate') {
     $coinPricePerItem   = max(0, (int)($plan['coin_price'] ?? 0));
     $totalRewardCoins   = $rewardCoinsPerItem * $quantity;
 
-    $rawRetailPrice = (float)(($plan['user_price'] ?? 0) ?: (($plan['price'] ?? 0) ?: ($plan['reseller_price'] ?? 0)));
+    $rawRetailPrice = (float)(ffCustomerBasePrice($plan) ?: (($plan['price'] ?? 0) ?: ($plan['reseller_price'] ?? 0)));
     $rawResellPrice = (float)(($plan['reseller_price'] ?? 0) ?: (($plan['price'] ?? 0) ?: ($plan['user_price'] ?? 0)));
     $basePrice      = ($userRole === 'reseller') ? ($rawResellPrice > 0 ? $rawResellPrice : $rawRetailPrice) : ($rawRetailPrice > 0 ? $rawRetailPrice : $rawResellPrice);
 
@@ -2790,7 +2802,7 @@ try {
                    p.app_download_url, p.maintenance_message,
                    pl.id as plan_id, 
                    COALESCE(NULLIF(pl.plan_title, ''), NULLIF(pl.validity, ''), 'Standard Plan') as validity, 
-                   pl.reseller_price, pl.user_price, pl.price, pl.reseller_discount_percent, 
+                   pl.reseller_price, pl.user_price, pl.price, pl.regular_price, pl.reseller_discount_percent, 
                    COALESCE(pl.discount_percent, 0) as discount_percent, pl.api_plan_id,
                    pl.reward_coins, pl.coin_price 
             FROM `products` p
@@ -2821,7 +2833,7 @@ try {
         $globalMaintRules = !empty($settings['prod_maintenance_default_rules']) ? $settings['prod_maintenance_default_rules'] : "⚠️ Rules & Conditions:\nএই প্রোডাক্টটির সার্ভার আপগ্রেড চলছে। সাময়িক অসুবিধার জন্য আমরা দুঃখিত। খুব শীঘ্রই সার্ভিস চালু করা হবে।";
         $prodMaintenanceMsg = !empty($dp['maintenance_message']) ? $dp['maintenance_message'] : $globalMaintRules;
 
-        $rawRetailUSD = (float)(($dp['user_price'] ?? 0) ?: (($dp['price'] ?? 0) ?: ($dp['reseller_price'] ?? 0)));
+        $rawRetailUSD = (float)(ffCustomerBasePrice($dp) ?: (($dp['price'] ?? 0) ?: ($dp['reseller_price'] ?? 0)));
         $rawResellUSD = (float)(($dp['reseller_price'] ?? 0) ?: (($dp['price'] ?? 0) ?: ($dp['user_price'] ?? 0)));
 
         $regularBaseUSD = ($userRole === 'reseller')

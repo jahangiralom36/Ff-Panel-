@@ -1117,12 +1117,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_action'])) {
                 
                 $currPlan = $pdo->query("SELECT discount_percent, regular_price FROM product_plans WHERE id = " . (int)$planId)->fetch(PDO::FETCH_ASSOC);
                 $dPercent = (float)($currPlan['discount_percent'] ?? 0);
-                $newRegPrice = ($dPercent > 0 && (float)($currPlan['regular_price'] ?? 0) > 0) ? (float)$currPlan['regular_price'] : $uP;
+                // the typed customer price is the regular (original) price; discount (if any) is applied on top
+                $newRegPrice  = $uP;
+                $newUserPrice = ($dPercent > 0) ? max(0.01, round($uP * (1 - ($dPercent / 100)), 2)) : $uP;
 
                 // নির্দিষ্ট প্ল্যান Stock Out চেক
                 $isPlanStockOut = !empty($_POST['plan_out_of_stock'][$planId]) ? 1 : 0;
 
-                $upPlan->execute([$uP, $newRegPrice, $rP, $isPlanStockOut, (int)$planId, $prodId]);
+                $upPlan->execute([$newUserPrice, $newRegPrice, $rP, $isPlanStockOut, (int)$planId, $prodId]);
             }
         }
         $toast = ['type' => 'success', 'msg' => 'Product, Plans & Maintenance Rules updated!'];
@@ -5432,7 +5434,8 @@ $providerBalance = km_get_cached_provider_balance($pdo);
                 prod.plans.forEach(pl => {
                     const row = document.createElement('div');
                     row.className = "p-3 rounded-xl bg-white border border-slate-200 space-y-2 text-xs shadow-sm";
-                    const bdt = Math.round(parseFloat(pl.user_price) * currentBdtRate);
+                    const custBase = (parseFloat(pl.discount_percent || 0) > 0 && parseFloat(pl.regular_price || 0) > 0) ? parseFloat(pl.regular_price) : parseFloat(pl.user_price);
+                    const bdt = Math.round(custBase * currentBdtRate);
                     const isStockOut = (parseInt(pl.is_out_of_stock) === 1);
 
                     row.innerHTML = `
@@ -5451,7 +5454,7 @@ $providerBalance = km_get_cached_provider_balance($pdo);
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1 border-t border-slate-100">
                             <div>
                                 <label class="text-[9px] text-slate-500 block font-bold">Price ($ USD)</label>
-                                <input type="number" step="0.01" name="plan_user_price[${pl.id}]" value="${parseFloat(pl.user_price).toFixed(2)}" class="w-full bg-slate-50 border border-slate-200 p-1.5 rounded-lg text-emerald-700 font-mono font-bold text-xs outline-none">
+                                <input type="number" step="0.01" name="plan_user_price[${pl.id}]" value="${custBase.toFixed(2)}" class="w-full bg-slate-50 border border-slate-200 p-1.5 rounded-lg text-emerald-700 font-mono font-bold text-xs outline-none">
                                 <span class="text-[9px] text-slate-400 font-mono">≈ ৳${bdt} BDT</span>
                             </div>
                             <div>
