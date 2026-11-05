@@ -1087,6 +1087,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['auth_action'])) {
             header('Location: index.php');
             exit;
         }
+        // Gmail only: email must end with @gmail.com
+        if (!preg_match('/^[a-z0-9._%+\-]+@gmail\.com$/', $email)) {
+            $_SESSION['flash_toast'] = ['type' => 'error', 'msg' => 'Please use a valid Gmail address (must end with @gmail.com)!'];
+            header('Location: index.php');
+            exit;
+        }
 
         try {
             $stmtChk = $pdo->prepare("SELECT `id` FROM `users` WHERE `username` = ? LIMIT 1");
@@ -2593,6 +2599,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'get_spin_data') {
             'segments'        => ffSpinWheelLabels($cfg),
             'remaining_spins' => $spins,
             'daily_left'      => $dailyLeft,
+            'daily_limit'     => $cfg['daily'],
             'spend_per_spin'  => $cfg['per_spin'],
             'spend_progress'  => $progress,
             'prize_min'       => $cfg['min'],
@@ -2646,14 +2653,17 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'spin_wheel') {
 
         $stDay = $pdo->prepare("SELECT COUNT(*) FROM `user_spin_log` WHERE `user_id` = ? AND DATE(`created_at`) = CURDATE()");
         $stDay->execute([$uid]);
-        if ((int)$stDay->fetchColumn() >= $cfg['daily']) {
+        $todayUsed = (int)$stDay->fetchColumn();
+        if ($todayUsed >= $cfg['daily']) {
             $pdo->rollBack();
             echo json_encode(['status' => 'error', 'message' => 'আজকের স্পিন লিমিট শেষ! কাল আবার চেষ্টা করুন।']);
             exit;
         }
 
-        // Random prize between admin min..max (BDT)
-        $prizeBdt = random_int($cfg['min'], $cfg['max']);
+        // Prize = one of the wheel slices (admin min..max), so the wheel shows exactly what is won
+        $spinLabels = ffSpinWheelLabels($cfg);
+        $wonIndex   = random_int(0, count($spinLabels) - 1);
+        $prizeBdt   = (int)$spinLabels[$wonIndex]['bonus_amount'];
         $prizeUsd = round($prizeBdt / $effectiveBdtRate, 4);
 
         $pdo->prepare("UPDATE `user_spin_wallet` SET `spins_available` = `spins_available` - 1, `total_used` = `total_used` + 1 WHERE `user_id` = ?")->execute([$uid]);
@@ -2664,15 +2674,6 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'spin_wheel') {
 
         $pdo->commit();
 
-        // pick wheel slice nearest to the real prize
-        $labels = ffSpinWheelLabels($cfg);
-        $bestDiff = PHP_INT_MAX; $cands = [];
-        foreach ($labels as $i => $l) {
-            $d = abs((int)$l['bonus_amount'] - $prizeBdt);
-            if ($d < $bestDiff) { $bestDiff = $d; $cands = [$i]; }
-            elseif ($d === $bestDiff) { $cands[] = $i; }
-        }
-        $wonIndex = $cands[array_rand($cands)];
 
         $stB = $pdo->prepare("SELECT `balance` FROM `users` WHERE `id` = ? LIMIT 1");
         $stB->execute([$uid]);
@@ -2685,6 +2686,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'spin_wheel') {
             'prize_bdt'          => $prizeBdt,
             'is_win'             => true,
             'spins_left'         => $spinsLeft - 1,
+            'daily_left'         => max(0, $cfg['daily'] - $todayUsed - 1),
             'new_balance_bdt'    => $newBalBdt,
             'bengali_offer_text' => 'অভিনন্দন! আপনি ৳' . $prizeBdt . ' জিতেছেন — টাকা ওয়ালেটে যোগ হয়ে গেছে!'
         ]);
@@ -3926,7 +3928,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
 
                     <div class="bg-black/20 p-2.5 rounded-xl border border-white/10 max-w-sm mx-auto flex items-center justify-between text-xs">
                         <span id="myReferralLinkText" class="truncate font-mono text-emerald-100 text-[11px] mr-2">
-                            <?= htmlspecialchars(SITE_URL . '?ref=' . ($user['referral_code'] ?? '13183')) ?>
+                            <?= htmlspecialchars(rtrim(SITE_URL, '/') . '/index.php?ref=' . ($user['referral_code'] ?? '13183')) ?>
                         </span>
                         <button type="button" onclick="copyReferralLink()" class="px-3 py-1 rounded-lg bg-emerald-500 text-slate-900 font-bold text-[10px] active:scale-95 transition flex-shrink-0">
                             Copy Link
@@ -4310,7 +4312,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
                     </div>
                     
                     <div class="flex items-center gap-2">
-                        <input type="text" readonly value="<?= htmlspecialchars(SITE_URL . '/register?ref=' . ($user['referral_code'] ?? '13183')) ?>" class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-[11px] font-bold text-slate-700 outline-none">
+                        <input type="text" readonly value="<?= htmlspecialchars(rtrim(SITE_URL, '/') . '/index.php?ref=' . ($user['referral_code'] ?? '13183')) ?>" class="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-[11px] font-bold text-slate-700 outline-none">
                         <button onclick="copyReferralLink()" class="px-4 py-2.5 bg-[#1a8a36] text-white rounded-xl text-[11px] font-bold flex items-center gap-1.5 hover:bg-emerald-700 transition">
                             <i class="fa-regular fa-copy"></i> Copy
                         </button>
@@ -5027,8 +5029,8 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
                     <input type="text" name="reg_username" required placeholder="username" class="w-full bg-slate-50 border border-slate-200 p-2 rounded-xl outline-none focus:border-emerald-500 font-mono">
                 </div>
                 <div>
-                    <label class="text-[10px] font-bold text-slate-600 uppercase block mb-0.5">Email (Optional)</label>
-                    <input type="email" name="reg_email" placeholder="email@gmail.com" class="w-full bg-slate-50 border border-slate-200 p-2 rounded-xl outline-none focus:border-emerald-500 font-mono">
+                    <label class="text-[10px] font-bold text-slate-600 uppercase block mb-0.5">Gmail <span class="text-rose-500">*</span></label>
+                    <input type="email" name="reg_email" required pattern="^[A-Za-z0-9._%+\-]+@[Gg][Mm][Aa][Ii][Ll]\.[Cc][Oo][Mm]$" title="Gmail address must end with @gmail.com" placeholder="yourname@gmail.com" class="w-full bg-slate-50 border border-slate-200 p-2 rounded-xl outline-none focus:border-emerald-500 font-mono">
                 </div>
                 <div>
                     <label class="text-[10px] font-bold text-slate-600 uppercase block mb-0.5">Password</label>
@@ -5084,6 +5086,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
             <div class="flex items-center justify-center gap-2 text-[11px] font-bold">
                 <span class="px-2.5 py-1 rounded-full bg-emerald-50 border border-emerald-200 text-emerald-700">Spins: <b id="spinCountText">0</b></span>
                 <span id="spinPrizeRangeText" class="px-2.5 py-1 rounded-full bg-slate-50 border border-slate-200 text-slate-600"></span>
+                <span class="px-2.5 py-1 rounded-full bg-amber-50 border border-amber-200 text-amber-700">Today: <b id="spinDailyText">0/0</b></span>
             </div>
             
             <div class="relative w-[240px] h-[240px] mx-auto flex items-center justify-center my-2">
@@ -6099,7 +6102,7 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
         function copyReferralLink() {
             const el = document.getElementById('myReferralLinkText');
             if (!el) return;
-            const link = el.innerText.trim() || '<?= SITE_URL . '?ref=' . ($user['referral_code'] ?? '13183') ?>';
+            const link = el.innerText.trim() || '<?= htmlspecialchars(rtrim(SITE_URL, '/') . '/index.php?ref=' . ($user['referral_code'] ?? '13183'), ENT_QUOTES) ?>';
             navigator.clipboard.writeText(link);
             showToast('Referral link copied to clipboard!', 'success');
         }
@@ -6391,6 +6394,8 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
 
         function renderSpinInfo(d) {
             document.getElementById('spinCountText').innerText = d.logged_in ? d.remaining_spins : 0;
+            const dailyEl = document.getElementById('spinDailyText');
+            if (dailyEl) dailyEl.innerText = (d.daily_left ?? 0) + '/' + (d.daily_limit ?? 0) + ' left';
             document.getElementById('spinPrizeRangeText').innerText = 'Win ৳' + d.prize_min + ' – ৳' + d.prize_max;
 
             const per  = Math.max(1, parseFloat(d.spend_per_spin) || 500);
@@ -6405,7 +6410,8 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
             } else if (!d.logged_in) {
                 hint.innerText = 'স্পিন করতে আগে লগইন করুন।';
             } else {
-                hint.innerText = '৳' + Math.round(per) + ' টাকার প্রোডাক্ট কিনলেই ১টি স্পিন! জিতলে টাকা সরাসরি ওয়ালেটে।';
+                hint.innerText = '৳' + Math.round(per) + ' টাকার প্রোডাক্ট কিনলেই ১টি স্পিন! দিনে সর্বোচ্চ ' + (d.daily_limit ?? 0) + 'টি স্পিন। জিতলে ৳' + d.prize_min + ' – ৳' + d.prize_max + ' সরাসরি ওয়ালেটে।';
+                if (d.logged_in && (d.daily_left ?? 1) <= 0) hint.innerText = 'আজকের স্পিন লিমিট শেষ! কাল আবার স্পিন করতে পারবেন।';
             }
 
             const ref = document.getElementById('spinReferText');

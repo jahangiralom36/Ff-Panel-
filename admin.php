@@ -1329,11 +1329,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_action'])) {
 
     // H. USERS FLOAT
     if ($act === 'modify_balance') {
-        $userId = (int)$_POST['user_id'];
-        $amount = (float)$_POST['amount'];
-        if ($_POST['type'] === 'deduct') $amount = -$amount;
-        $pdo->prepare("UPDATE users SET balance = balance + ? WHERE id = ?")->execute([$amount, $userId]);
-        $toast = ['type' => 'success', 'msg' => "Wallet balance modified!"];
+        $userId = (int)($_POST['user_id'] ?? 0);
+        $amount = round(abs((float)($_POST['amount'] ?? 0)), 2);
+        $nonce  = preg_replace('/[^a-zA-Z0-9]/', '', (string)($_POST['bal_nonce'] ?? ''));
+        if (!isset($_SESSION['ff_used_bal_nonces']) || !is_array($_SESSION['ff_used_bal_nonces'])) $_SESSION['ff_used_bal_nonces'] = [];
+
+        if ($userId <= 0 || $amount <= 0) {
+            $toast = ['type' => 'error', 'msg' => 'Invalid amount!'];
+        } elseif ($nonce === '' || in_array($nonce, $_SESSION['ff_used_bal_nonces'], true)) {
+            // same form sent again (page refresh / double tap) -> do NOT add/deduct twice
+            $toast = ['type' => 'error', 'msg' => 'Already applied! (duplicate submit blocked)'];
+        } else {
+            $_SESSION['ff_used_bal_nonces'][] = $nonce;
+            $_SESSION['ff_used_bal_nonces'] = array_slice($_SESSION['ff_used_bal_nonces'], -50);
+            if (($_POST['type'] ?? 'add') === 'deduct') {
+                $pdo->prepare("UPDATE users SET balance = GREATEST(balance - ?, 0) WHERE id = ?")->execute([$amount, $userId]);
+                $toast = ['type' => 'success', 'msg' => '$' . number_format($amount, 2) . ' deducted from wallet!'];
+            } else {
+                $pdo->prepare("UPDATE users SET balance = balance + ? WHERE id = ?")->execute([$amount, $userId]);
+                $toast = ['type' => 'success', 'msg' => '$' . number_format($amount, 2) . ' added to wallet!'];
+            }
+        }
     }
 
     if ($act === 'toggle_ban') {
@@ -4970,8 +4986,9 @@ $providerBalance = km_get_cached_provider_balance($pdo);
                 </div>
             </div>
 
-            <form method="POST" class="space-y-3">
+            <form method="POST" class="space-y-3" onsubmit="if (this.dataset.sent === '1') return false; this.dataset.sent = '1'; setTimeout(() => { this.querySelectorAll('button[type=submit]').forEach(b => b.disabled = true); }, 0); return true;">
                 <input type="hidden" name="admin_action" value="modify_balance">
+                <input type="hidden" id="balanceModalNonce" name="bal_nonce" value="">
                 <input type="hidden" id="balanceModalActiveTab" name="active_tab" value="tab-customers">
                 <input type="hidden" id="balanceModalUserId" name="user_id">
 
@@ -5575,6 +5592,10 @@ $providerBalance = km_get_cached_provider_balance($pdo);
 
         function openBalanceModal(id, username, email, balance, status) {
             document.getElementById('balanceModalUserId').value = id;
+            const balNonce = document.getElementById('balanceModalNonce');
+            if (balNonce) balNonce.value = Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+            const balForm = balNonce ? balNonce.form : null;
+            if (balForm) { balForm.dataset.sent = ''; balForm.querySelectorAll('button[type=submit]').forEach(b => b.disabled = false); }
             document.getElementById('banModalUserId').value = id;
             document.getElementById('banModalStatus').value = status;
             document.getElementById('balanceModalUsername').innerText = username;
