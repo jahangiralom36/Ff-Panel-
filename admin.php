@@ -259,6 +259,10 @@ $settings = [
     'site_name'                    => defined('SITE_NAME') ? SITE_NAME : 'FF PANEL SELL',
     'site_logo'                    => '',
     'loading_logo'                 => '',
+    'site_favicon'                 => '',
+    'seo_title'                    => '',
+    'seo_description'              => '',
+    'seo_keywords'                 => '',
     'theme_color'                  => '#15803d',
     'usdt_rate'                    => '125',
     'binance_market_rate'          => '125',
@@ -985,7 +989,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_action'])) {
                     $userPrice     = round($basePrice * 1.25, 2);
 
                     if (!$planExists) {
-                        $stmtPlanIns = $pdo->prepare("INSERT INTO product_plans (product_id, duration_days, plan_title, reseller_price, user_price, regular_price, discount_percent, reseller_discount_percent, api_plan_id) VALUES (?, 30, ?, ?, ?, ?, 0.00, 20.00, ?)");
+                        $stmtPlanIns = $pdo->prepare("INSERT INTO product_plans (product_id, duration_days, plan_title, reseller_price, user_price, regular_price, discount_percent, reseller_discount_percent, api_plan_id) VALUES (?, 30, ?, ?, ?, ?, 0.00, 0.00, ?)");
                         $stmtPlanIns->execute([$prodId, $planTitle, $resellerPrice, $userPrice, $userPrice, $extId]);
                     } else {
                         $stmtPlanUp = $pdo->prepare("UPDATE product_plans SET product_id = ?, plan_title = ?, reseller_price = ?, user_price = ?, regular_price = ? WHERE api_plan_id = ?");
@@ -1041,7 +1045,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_action'])) {
                         $userPrice     = round($basePrice * 1.25, 2);
 
                         if (!$planExists) {
-                            $stmtPlanIns = $pdo->prepare("INSERT INTO product_plans (product_id, duration_days, plan_title, reseller_price, user_price, regular_price, discount_percent, reseller_discount_percent, api_plan_id) VALUES (?, 30, ?, ?, ?, ?, 0.00, 20.00, ?)");
+                            $stmtPlanIns = $pdo->prepare("INSERT INTO product_plans (product_id, duration_days, plan_title, reseller_price, user_price, regular_price, discount_percent, reseller_discount_percent, api_plan_id) VALUES (?, 30, ?, ?, ?, ?, 0.00, 0.00, ?)");
                             $stmtPlanIns->execute([$prodId, $planTitle, $resellerPrice, $userPrice, $userPrice, $extId]);
                         } else {
                             $stmtPlanUp = $pdo->prepare("UPDATE product_plans SET product_id = ?, plan_title = ?, reseller_price = ?, user_price = ?, regular_price = ? WHERE api_plan_id = ?");
@@ -1674,6 +1678,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_action'])) {
         $supportCh       = trim($_POST['support_channel'] ?? '');
         $siteLogoPath    = $settings['site_logo'] ?? '';
         $loadingLogoPath = $settings['loading_logo'] ?? '';
+        $faviconPath     = $settings['site_favicon'] ?? '';
+        $seoTitle        = trim($_POST['seo_title'] ?? ($settings['seo_title'] ?? ''));
+        $seoDesc         = trim($_POST['seo_description'] ?? ($settings['seo_description'] ?? ''));
+        $seoKeys         = trim($_POST['seo_keywords'] ?? ($settings['seo_keywords'] ?? ''));
         $gClientId       = trim($_POST['google_client_id'] ?? '');
         $gClientSecret   = trim($_POST['google_client_secret'] ?? '');
         $gRedirectUri    = trim($_POST['google_redirect_uri'] ?? '');
@@ -1691,6 +1699,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_action'])) {
 
         if (!empty($_POST['delete_site_logo'])) $siteLogoPath = '';
         if (!empty($_POST['delete_loading_logo'])) $loadingLogoPath = '';
+        if (!empty($_POST['delete_site_favicon'])) $faviconPath = '';
+        if (!empty($_FILES['site_favicon_file']['name']) && $_FILES['site_favicon_file']['error'] === UPLOAD_ERR_OK) {
+            $ext = strtolower(pathinfo($_FILES['site_favicon_file']['name'], PATHINFO_EXTENSION));
+            if (in_array($ext, ['png', 'jpg', 'jpeg', 'webp', 'ico', 'svg', 'gif'])) {
+                if (!is_dir($siteUploadDir)) @mkdir($siteUploadDir, 0755, true);
+                $fileName = 'favicon_' . time() . '.' . $ext;
+                if (move_uploaded_file($_FILES['site_favicon_file']['tmp_name'], $siteUploadDir . $fileName)) {
+                    $faviconPath = 'uploads/site/' . $fileName;
+                }
+            }
+        }
 
         if (!empty($_FILES['site_logo_file']['name']) && $_FILES['site_logo_file']['error'] === UPLOAD_ERR_OK) {
             $ext = strtolower(pathinfo($_FILES['site_logo_file']['name'], PATHINFO_EXTENSION));
@@ -1720,6 +1739,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_action'])) {
             'support_channel'                => $supportCh,
             'site_logo'                      => $siteLogoPath,
             'loading_logo'                   => $loadingLogoPath,
+            'site_favicon'                   => $faviconPath,
+            'seo_title'                      => $seoTitle,
+            'seo_description'                => $seoDesc,
+            'seo_keywords'                   => $seoKeys,
             'site_maintenance_mode'          => $maintMode,
             'site_maintenance_msg'           => $maintMsg,
             'top_ticker_notice'              => $topTickerNotice,
@@ -4218,6 +4241,40 @@ $providerBalance = km_get_cached_provider_balance($pdo);
                             <?php endif; ?>
                             <input type="file" name="loading_logo_file" accept="image/*" class="w-full text-slate-500 file:mr-2 file:py-1.5 file:px-3 file:rounded-xl file:border-0 file:text-xs file:bg-emerald-600 file:text-white">
                         </div>
+                    </div>
+
+                    <!-- SITE ICON (Google / Chrome search result & browser tab) -->
+                    <div class="bg-slate-50 p-3.5 rounded-2xl border border-slate-200 space-y-2">
+                        <label class="text-slate-700 block font-bold">Site Icon / Favicon (Google search &amp; browser tab logo)</label>
+                        <?php if (!empty($settings['site_favicon'])): ?>
+                            <div class="flex items-center space-x-2 pb-1">
+                                <img src="<?= htmlspecialchars($settings['site_favicon']) ?>" class="w-8 h-8 rounded-lg object-cover border border-slate-200">
+                                <label class="text-[10px] text-rose-500 cursor-pointer flex items-center space-x-1">
+                                    <input type="checkbox" name="delete_site_favicon" value="1">
+                                    <span>Remove Icon</span>
+                                </label>
+                            </div>
+                        <?php endif; ?>
+                        <input type="file" name="site_favicon_file" accept="image/png,image/jpeg,image/webp,image/x-icon,image/svg+xml" class="w-full text-slate-500 file:mr-2 file:py-1.5 file:px-3 file:rounded-xl file:border-0 file:text-xs file:bg-emerald-600 file:text-white">
+                        <span class="text-[10px] text-slate-400 font-sans block">Square image (512×512 PNG best). Khali thakle Site Header Logo use hobe. Google search-e notun icon dekhate kichu din lagte pare.</span>
+                    </div>
+
+                    <!-- SEO -->
+                    <div class="bg-slate-50 p-3.5 rounded-2xl border border-slate-200 space-y-2.5">
+                        <label class="text-slate-700 block font-bold">SEO (Google Search)</label>
+                        <div>
+                            <span class="text-[10px] text-slate-500 block mb-1">SEO Title (search result-er boro lekha)</span>
+                            <input type="text" name="seo_title" maxlength="70" value="<?= htmlspecialchars($settings['seo_title'] ?? '') ?>" placeholder="FF Panel Sell — Official Store | Free Fire Panel Shop BD" class="w-full bg-white border border-slate-200 p-2.5 rounded-xl text-slate-900 text-xs outline-none focus:border-emerald-600">
+                        </div>
+                        <div>
+                            <span class="text-[10px] text-slate-500 block mb-1">SEO Description (search result-er niche-r lekha, 150-160 akkhor)</span>
+                            <textarea name="seo_description" rows="3" maxlength="300" placeholder="Bangladesh's trusted Free Fire panel store. Instant auto delivery..." class="w-full bg-white border border-slate-200 p-2.5 rounded-xl text-slate-900 text-xs outline-none focus:border-emerald-600 font-sans"><?= htmlspecialchars($settings['seo_description'] ?? '') ?></textarea>
+                        </div>
+                        <div>
+                            <span class="text-[10px] text-slate-500 block mb-1">SEO Keywords (comma diye)</span>
+                            <input type="text" name="seo_keywords" value="<?= htmlspecialchars($settings['seo_keywords'] ?? '') ?>" placeholder="ff panel, free fire panel, drip client, ..." class="w-full bg-white border border-slate-200 p-2.5 rounded-xl text-slate-900 text-xs outline-none focus:border-emerald-600">
+                        </div>
+                        <span class="text-[10px] text-slate-400 font-sans block">Khali rakhle website nijei bhalo default SEO lekha use korbe.</span>
                     </div>
 
                     <button type="submit" class="w-full py-3.5 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold rounded-xl uppercase text-xs shadow-md transition active:scale-95">

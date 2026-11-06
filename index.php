@@ -738,6 +738,34 @@ function ffCustomerBasePrice(array $pl): float {
 }
 
 // ====================================================================
+// ONE PRICE RULE FOR EVERYONE
+//  - customer: customer price (plan discount applied once)
+//  - reseller: reseller price, but NEVER more than the customer price
+//  - extra discount ONLY from admin "Customer / Reseller discount" (users.discount_percent)
+//  - plan `reseller_discount_percent` (old auto 20% from KM sync) is ignored
+// returns [final_usd, original_usd]
+// ====================================================================
+function ffPlanPrice(array $pl, string $role, float $userDiscPercent = 0.0): array {
+    $custBase  = (float)(ffCustomerBasePrice($pl) ?: (($pl['price'] ?? 0) ?: ($pl['reseller_price'] ?? 0)));
+    $planDisc  = max(0.0, min(99.0, (float)($pl['discount_percent'] ?? 0)));
+    $custFinal = ($planDisc > 0 && $custBase > 0) ? round($custBase * (1 - $planDisc / 100), 2) : $custBase;
+
+    if ($role === 'reseller') {
+        $resPrice = (float)($pl['reseller_price'] ?? 0);
+        $base     = ($resPrice > 0) ? $resPrice : $custFinal;
+        if ($custFinal > 0 && $base > $custFinal) $base = $custFinal; // reseller never pays more than a customer
+        $original = $base; // badge shows only the discount admin gives
+    } else {
+        $base     = $custFinal;
+        $original = ($custBase > 0) ? $custBase : $custFinal;
+    }
+
+    $ud    = max(0.0, min(99.0, $userDiscPercent));
+    $final = ($ud > 0) ? round($base * (1 - $ud / 100), 2) : round($base, 2);
+    return [max(0.01, $final), round($original, 2)];
+}
+
+// ====================================================================
 // TRX GUARD: rejected / already-used TrxID block + failed-verify attempt counter
 // ====================================================================
 if (!defined('FF_TRX_MAX_AUTO_TRIES')) define('FF_TRX_MAX_AUTO_TRIES', 2); // after 2 failed tries -> manual admin request
@@ -1431,6 +1459,7 @@ $userBalanceUsdt  = (float)$user['balance'];
 // Reseller Specific Products & Custom Pricing
 $userCustomPrices    = [];
 $userAllowedProducts = [];
+$userDiscountPercent = $isLoggedIn ? max(0.0, min(99.0, (float)($user['discount_percent'] ?? 0))) : 0.0;
 
 // Admin custom prices work for BOTH customers and resellers
 if ($isLoggedIn) {
@@ -1673,19 +1702,14 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_and_delive
     $rewardCoinsPerItem = max(0, (int)($plan['reward_coins'] ?? 0));
     $totalRewardCoins   = $rewardCoinsPerItem * $quantity;
 
-    $rawRetailPrice = (float)(ffCustomerBasePrice($plan) ?: (($plan['price'] ?? 0) ?: ($plan['reseller_price'] ?? 0)));
-    $rawResellPrice = (float)(($plan['reseller_price'] ?? 0) ?: (($plan['price'] ?? 0) ?: ($plan['user_price'] ?? 0)));
-    $basePrice      = ($userRole === 'reseller') ? ($rawResellPrice > 0 ? $rawResellPrice : $rawRetailPrice) : ($rawRetailPrice > 0 ? $rawRetailPrice : $rawResellPrice);
+    [$ffFinalUsd, $ffOrigUsd] = ffPlanPrice($plan, $userRole, $userDiscountPercent);
+    $basePrice = $ffOrigUsd;
 
     $unitPrice = null;
     if (isset($userCustomPrices[$planId]) && (float)$userCustomPrices[$planId] > 0) {
         $unitPrice = (float)$userCustomPrices[$planId];
     } else {
-        $explicitDiscount = ($userRole === 'reseller') 
-            ? (float)($plan['reseller_discount_percent'] ?? 0) 
-            : (float)($plan['discount_percent'] ?? 0);
-
-        $unitPrice = ($explicitDiscount > 0) ? round($basePrice * (1 - ($explicitDiscount / 100)), 2) : $basePrice;
+        $unitPrice = $ffFinalUsd;
     }
 
     $promoDiscountPercent = 0.00;
@@ -2086,23 +2110,14 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'live_generate') {
     $coinPricePerItem   = max(0, (int)($plan['coin_price'] ?? 0));
     $totalRewardCoins   = $rewardCoinsPerItem * $quantity;
 
-    $rawRetailPrice = (float)(ffCustomerBasePrice($plan) ?: (($plan['price'] ?? 0) ?: ($plan['reseller_price'] ?? 0)));
-    $rawResellPrice = (float)(($plan['reseller_price'] ?? 0) ?: (($plan['price'] ?? 0) ?: ($plan['user_price'] ?? 0)));
-    $basePrice      = ($userRole === 'reseller') ? ($rawResellPrice > 0 ? $rawResellPrice : $rawRetailPrice) : ($rawRetailPrice > 0 ? $rawRetailPrice : $rawResellPrice);
+    [$ffFinalUsd, $ffOrigUsd] = ffPlanPrice($plan, $userRole, $userDiscountPercent);
+    $basePrice = $ffOrigUsd;
 
     $unitPrice = null;
     if (isset($userCustomPrices[$planId]) && (float)$userCustomPrices[$planId] > 0) {
         $unitPrice = (float)$userCustomPrices[$planId];
     } else {
-        $explicitDiscount = ($userRole === 'reseller') 
-            ? (float)($plan['reseller_discount_percent'] ?? 0) 
-            : (float)($plan['discount_percent'] ?? 0);
-
-        if ($explicitDiscount > 0) {
-            $unitPrice = round($basePrice * (1 - ($explicitDiscount / 100)), 2);
-        } else {
-            $unitPrice = $basePrice;
-        }
+        $unitPrice = $ffFinalUsd;
     }
 
     $promoDiscountPercent = 0.00;
@@ -2841,27 +2856,17 @@ try {
         $globalMaintRules = !empty($settings['prod_maintenance_default_rules']) ? $settings['prod_maintenance_default_rules'] : "⚠️ Rules & Conditions:\nএই প্রোডাক্টটির সার্ভার আপগ্রেড চলছে। সাময়িক অসুবিধার জন্য আমরা দুঃখিত। খুব শীঘ্রই সার্ভিস চালু করা হবে।";
         $prodMaintenanceMsg = !empty($dp['maintenance_message']) ? $dp['maintenance_message'] : $globalMaintRules;
 
-        $rawRetailUSD = (float)(ffCustomerBasePrice($dp) ?: (($dp['price'] ?? 0) ?: ($dp['reseller_price'] ?? 0)));
-        $rawResellUSD = (float)(($dp['reseller_price'] ?? 0) ?: (($dp['price'] ?? 0) ?: ($dp['user_price'] ?? 0)));
-
-        $regularBaseUSD = ($userRole === 'reseller')
-            ? (($rawResellUSD > 0) ? $rawResellUSD : $rawRetailUSD)
-            : (($rawRetailUSD > 0) ? $rawRetailUSD : $rawResellUSD);
-
-        $finalPrice = $regularBaseUSD;
-        $originalPriceUSD = $regularBaseUSD;
+        [$finalPrice, $originalPriceUSD] = ffPlanPrice($dp, $userRole, $userDiscountPercent);
         $planDiscount = 0;
 
-        $explicitDiscount = ($userRole === 'reseller')
-            ? (float)($dp['reseller_discount_percent'] ?? 0)
-            : (float)($dp['discount_percent'] ?? 0);
-
         if ($planId > 0 && isset($userCustomPrices[$planId]) && (float)$userCustomPrices[$planId] > 0) {
-            $finalPrice = (float)$userCustomPrices[$planId];
-        } elseif ($explicitDiscount > 0) {
-            $planDiscount = (int)round($explicitDiscount);
-            $finalPrice   = round($regularBaseUSD * (1 - ($planDiscount / 100)), 2);
-            $originalPriceUSD = $regularBaseUSD;
+            $finalPrice       = (float)$userCustomPrices[$planId];
+            $originalPriceUSD = $finalPrice;
+        } elseif ($originalPriceUSD > $finalPrice && $originalPriceUSD > 0) {
+            $planDiscount = (int)round((1 - ($finalPrice / $originalPriceUSD)) * 100);
+            if ($planDiscount <= 0) $originalPriceUSD = $finalPrice;
+        } else {
+            $originalPriceUSD = $finalPrice;
         }
 
         if (!isset($catalogProducts[$pId])) {
@@ -3033,7 +3038,67 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <meta name="theme-color" content="<?= htmlspecialchars($primaryThemeColor) ?>">
-    <title><?= htmlspecialchars($storeTitleName) ?> — Official Store</title>
+<?php
+    $ffBase      = defined('SITE_URL') ? rtrim(SITE_URL, '/') : ((!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off' ? 'https' : 'http') . '://' . ($_SERVER['HTTP_HOST'] ?? 'ffpanelsell.shop'));
+    $ffAbs       = function ($u) use ($ffBase) { $u = trim((string)$u); if ($u === '') return ''; return preg_match('#^https?://#i', $u) ? $u : $ffBase . '/' . ltrim($u, '/'); };
+    $ffFavicon   = $ffAbs(!empty($settings['site_favicon']) ? $settings['site_favicon'] : ($settings['site_logo'] ?? ''));
+    $ffSeoTitle  = trim((string)($settings['seo_title'] ?? '')) !== '' ? trim($settings['seo_title']) : ($storeTitleName . ' — Official Store | Free Fire Panel, Mod & Key Shop Bangladesh');
+    $ffSeoDesc   = trim((string)($settings['seo_description'] ?? '')) !== '' ? trim($settings['seo_description']) : ($storeTitleName . ' - Bangladesh\'s trusted Free Fire panel store. Buy Drip Client, Phantom, XREG, Bala Mod, Angry Mod & more with instant auto delivery in 0.1 seconds. bKash, Nagad, Rocket & USDT payment.');
+    $ffSeoKeys   = trim((string)($settings['seo_keywords'] ?? '')) !== '' ? trim($settings['seo_keywords']) : 'ff panel, free fire panel, ff panel sell, ffpanelsell, drip client, phantom panel, xreg, bala mod, angry mod, ff mod apk, free fire hack panel bangladesh, ff key shop, instant delivery';
+    $ffOgImage   = $ffAbs(!empty($settings['site_logo']) ? $settings['site_logo'] : ($settings['site_favicon'] ?? ''));
+    $ffCanonical = $ffBase . '/';
+?>
+    <title><?= htmlspecialchars($ffSeoTitle) ?></title>
+    <meta name="description" content="<?= htmlspecialchars($ffSeoDesc) ?>">
+    <meta name="keywords" content="<?= htmlspecialchars($ffSeoKeys) ?>">
+    <meta name="robots" content="<?= $isSiteMaintenance ? 'noindex, nofollow' : 'index, follow, max-image-preview:large' ?>">
+    <link rel="canonical" href="<?= htmlspecialchars($ffCanonical) ?>">
+    <meta name="application-name" content="<?= htmlspecialchars($storeTitleName) ?>">
+    <meta name="apple-mobile-web-app-title" content="<?= htmlspecialchars($storeTitleName) ?>">
+<?php if ($ffFavicon !== ''): ?>
+    <link rel="icon" href="<?= htmlspecialchars($ffFavicon) ?>" sizes="any">
+    <link rel="icon" type="image/png" sizes="192x192" href="<?= htmlspecialchars($ffFavicon) ?>">
+    <link rel="shortcut icon" href="<?= htmlspecialchars($ffFavicon) ?>">
+    <link rel="apple-touch-icon" href="<?= htmlspecialchars($ffFavicon) ?>">
+<?php endif; ?>
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="<?= htmlspecialchars($storeTitleName) ?>">
+    <meta property="og:title" content="<?= htmlspecialchars($ffSeoTitle) ?>">
+    <meta property="og:description" content="<?= htmlspecialchars($ffSeoDesc) ?>">
+    <meta property="og:url" content="<?= htmlspecialchars($ffCanonical) ?>">
+    <meta property="og:locale" content="bn_BD">
+<?php if ($ffOgImage !== ''): ?>
+    <meta property="og:image" content="<?= htmlspecialchars($ffOgImage) ?>">
+    <meta name="twitter:image" content="<?= htmlspecialchars($ffOgImage) ?>">
+<?php endif; ?>
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="<?= htmlspecialchars($ffSeoTitle) ?>">
+    <meta name="twitter:description" content="<?= htmlspecialchars($ffSeoDesc) ?>">
+<?php
+    $ffLd = [
+        '@context' => 'https://schema.org',
+        '@graph'   => [
+            array_filter([
+                '@type' => 'Organization',
+                '@id'   => $ffCanonical . '#org',
+                'name'  => $storeTitleName,
+                'url'   => $ffCanonical,
+                'logo'  => $ffFavicon ?: null,
+                'sameAs'=> array_values(array_filter([$settings['support_telegram'] ?? '', $settings['support_facebook'] ?? '', $settings['support_channel'] ?? ''])),
+            ]),
+            [
+                '@type'       => 'WebSite',
+                '@id'         => $ffCanonical . '#website',
+                'name'        => $storeTitleName,
+                'url'         => $ffCanonical,
+                'description' => $ffSeoDesc,
+                'inLanguage'  => 'bn-BD',
+                'publisher'   => ['@id' => $ffCanonical . '#org'],
+            ],
+        ],
+    ];
+?>
+    <script type="application/ld+json"><?= json_encode($ffLd, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_HEX_TAG) ?></script>
     
     <script defer src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
@@ -3563,6 +3628,8 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
 
     <!-- 4. MAIN VIEWPORT CONTAINER -->
     <main class="w-full flex-grow px-3 pt-2 max-w-5xl mx-auto space-y-3.5">
+        <!-- SEO heading (screen-reader / Google only, design unchanged) -->
+        <h1 style="position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;"><?= htmlspecialchars($storeTitleName) ?> — Free Fire Panel, Mod &amp; Key Shop Bangladesh (Instant Delivery)</h1>
 
         <!-- =============================================================== -->
         <!-- 4A. STOREFRONT DASHBOARD TAB                                    -->

@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Disallow: /admin.php
+Disallow: /config.php
+Disallow: /uploads/keys/
+
+Sitemap: https://ffpanelsell.shop/sitemap.xml
