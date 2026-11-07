@@ -167,6 +167,129 @@ try {
 } catch (Throwable $e) {}
 
 // ====================================================================
+// REFERRAL PURCHASE COMMISSION
+//  When a referred user buys a product, the referrer earns commission.
+//  Admin sets: ON/OFF, how many days after signup (0 = lifetime),
+//  mode = percent (X% of order) OR spend (every ৳X spent = ৳Y),
+//  minimum order, and per-product override (off / % / fixed ৳ per item).
+// ====================================================================
+if (!function_exists('ffEnsureRefCommTables')) {
+    function ffEnsureRefCommTables(PDO $pdo): void {
+        static $done = false;
+        if ($done) return;
+        $done = true;
+        try {
+            $pdo->exec("CREATE TABLE IF NOT EXISTS `ref_commission_products` (
+                `product_id` INT NOT NULL PRIMARY KEY,
+                `comm_type` VARCHAR(10) NOT NULL DEFAULT 'default',
+                `comm_value` DECIMAL(10,2) NOT NULL DEFAULT 0.00
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+            $pdo->exec("CREATE TABLE IF NOT EXISTS `ref_commission_log` (
+                `id` INT AUTO_INCREMENT PRIMARY KEY,
+                `order_ref` VARCHAR(80) NOT NULL,
+                `referrer_id` INT NOT NULL,
+                `buyer_id` INT NOT NULL,
+                `product_id` INT NOT NULL DEFAULT 0,
+                `order_bdt` DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+                `commission_bdt` DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+                `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY `uq_order_ref` (`order_ref`),
+                INDEX (`referrer_id`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+        } catch (Throwable $e) {}
+    }
+}
+
+if (!function_exists('ffRefCommConfig')) {
+    function ffRefCommConfig(array $s): array {
+        return [
+            'enabled'      => (($s['ref_comm_enabled'] ?? '0') === '1'),
+            'days'         => max(0, (int)($s['ref_comm_days'] ?? 30)),
+            'mode'         => (($s['ref_comm_mode'] ?? 'percent') === 'spend') ? 'spend' : 'percent',
+            'percent'      => max(0.0, min(100.0, (float)($s['ref_comm_percent'] ?? 5))),
+            'spend_step'   => max(1.0, (float)($s['ref_comm_spend_step'] ?? 100)),
+            'spend_reward' => max(0.0, (float)($s['ref_comm_spend_reward'] ?? 5)),
+            'min_order'    => max(0.0, (float)($s['ref_comm_min_order'] ?? 0)),
+        ];
+    }
+}
+
+if (!function_exists('ffReferralCommission')) {
+    /**
+     * Call AFTER a purchase is committed (never inside an open DB transaction).
+     * $orderBdt = what the buyer paid in BDT, $qty = items bought.
+     */
+    function ffReferralCommission(PDO $pdo, array $settings, int $buyerId, int $productId, float $orderBdt, int $qty, string $orderRef): void {
+        $cfg = ffRefCommConfig($settings);
+        if (!$cfg['enabled'] || $buyerId <= 0 || $orderBdt <= 0) return;
+        if (($settings['referral_system_status'] ?? '1') !== '1') return;
+        if ($cfg['min_order'] > 0 && $orderBdt < $cfg['min_order']) return;
+        try {
+            ffEnsureRefCommTables($pdo);
+
+            $st = $pdo->prepare("SELECT `referred_by`, `username`, `created_at` FROM `users` WHERE `id` = ? LIMIT 1");
+            $st->execute([$buyerId]);
+            $buyer = $st->fetch(PDO::FETCH_ASSOC);
+            $refId = (int)($buyer['referred_by'] ?? 0);
+            if (!$buyer || $refId <= 0 || $refId === $buyerId) return;
+
+            // only for N days after the buyer's signup (0 = lifetime)
+            if ($cfg['days'] > 0 && !empty($buyer['created_at'])) {
+                $joined = strtotime((string)$buyer['created_at']);
+                if ($joined && (time() - $joined) > $cfg['days'] * 86400) return;
+            }
+
+            $st = $pdo->prepare("SELECT `id`, `status`, `custom_bdt_rate` FROM `users` WHERE `id` = ? LIMIT 1");
+            $st->execute([$refId]);
+            $ref = $st->fetch(PDO::FETCH_ASSOC);
+            if (!$ref || ($ref['status'] ?? 'active') !== 'active') return;
+
+            // per-product rule
+            $type = 'default'; $val = 0.0;
+            if ($productId > 0) {
+                $st = $pdo->prepare("SELECT `comm_type`, `comm_value` FROM `ref_commission_products` WHERE `product_id` = ? LIMIT 1");
+                $st->execute([$productId]);
+                if ($pr = $st->fetch(PDO::FETCH_ASSOC)) { $type = (string)$pr['comm_type']; $val = (float)$pr['comm_value']; }
+            }
+            if ($type === 'off') return;
+
+            if ($type === 'percent') {
+                $comm = $orderBdt * max(0.0, min(100.0, $val)) / 100;
+            } elseif ($type === 'fixed') {
+                $comm = max(0.0, $val) * max(1, $qty);
+            } elseif ($cfg['mode'] === 'spend') {
+                $comm = floor($orderBdt / $cfg['spend_step']) * $cfg['spend_reward'];
+            } else {
+                $comm = $orderBdt * $cfg['percent'] / 100;
+            }
+            $comm = round(min($comm, $orderBdt), 2);
+            if ($comm <= 0) return;
+
+            $rate = (float)($ref['custom_bdt_rate'] ?? 0) > 0 ? (float)$ref['custom_bdt_rate'] : max(1.0, (float)($settings['usdt_rate'] ?? 125));
+            $commUsd = round($comm / $rate, 4);
+
+            $pdo->beginTransaction();
+            $ins = $pdo->prepare("INSERT IGNORE INTO `ref_commission_log` (`order_ref`, `referrer_id`, `buyer_id`, `product_id`, `order_bdt`, `commission_bdt`) VALUES (?, ?, ?, ?, ?, ?)");
+            $ins->execute([substr($orderRef, 0, 80), $refId, $buyerId, $productId, round($orderBdt, 2), $comm]);
+            if ($ins->rowCount() === 0) { $pdo->rollBack(); return; } // already paid for this order
+
+            $pdo->prepare("UPDATE `users` SET `balance` = `balance` + ?, `referral_earnings` = `referral_earnings` + ? WHERE `id` = ?")
+                ->execute([$commUsd, $comm, $refId]);
+            $pdo->prepare("INSERT INTO `transactions` (`user_id`, `method`, `amount`, `bonus_amount`, `sender_num`, `trx_id`, `status`) VALUES (?, 'Referral Commission', ?, 0.00, ?, ?, 'approved')")
+                ->execute([$refId, $commUsd, 'From: ' . (string)($buyer['username'] ?? ''), 'REFC-' . strtoupper(substr(md5($orderRef), 0, 12))]);
+            $trxRowId = (int)$pdo->lastInsertId();
+            $pdo->commit();
+
+            try {
+                if ($trxRowId > 0) $pdo->prepare("UPDATE `transactions` SET `amount_bdt` = ? WHERE `id` = ?")->execute([$comm, $trxRowId]);
+            } catch (Throwable $e) {}
+        } catch (Throwable $e) {
+            try { if ($pdo->inTransaction()) $pdo->rollBack(); } catch (Throwable $e2) {}
+        }
+    }
+}
+
+// ====================================================================
 // 1. WEB ADMIN LOGIN & LOGOUT CONTROLLER
 // ====================================================================
 $authError = null;
@@ -278,6 +401,13 @@ $settings = [
     'support_channel'              => '',
     'referral_reward_amount'       => '5.00',
     'referral_system_status'       => '1',
+    'ref_comm_enabled'             => '0',
+    'ref_comm_days'                => '30',
+    'ref_comm_mode'                => 'percent',
+    'ref_comm_percent'             => '5',
+    'ref_comm_spend_step'          => '100',
+    'ref_comm_spend_reward'        => '5',
+    'ref_comm_min_order'           => '0',
     'referral_bdt_enabled'         => '1',
     'referral_coin_enabled'        => '1',
     'auto_payment_on'              => '0',
@@ -789,6 +919,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['admin_action'])) {
         $settings['referral_bdt_enabled']   = $bdtOn;
         $settings['referral_coin_enabled']  = $coinOn;
         $toast = ['type' => 'success', 'msg' => "Referral saved! BDT bonus: " . ($bdtOn === '1' ? ('ON (৳' . number_format($rewardAmt, 2) . ')') : 'OFF') . " | Coin system: " . ($coinOn === '1' ? 'ON' : 'OFF')];
+    }
+
+    // B2. REFERRAL PURCHASE COMMISSION
+    if ($act === 'save_ref_commission') {
+        ffEnsureRefCommTables($pdo);
+        $rc = [
+            'ref_comm_enabled'      => isset($_POST['ref_comm_enabled']) ? '1' : '0',
+            'ref_comm_days'         => (string)max(0, (int)($_POST['ref_comm_days'] ?? 30)),
+            'ref_comm_mode'         => (($_POST['ref_comm_mode'] ?? 'percent') === 'spend') ? 'spend' : 'percent',
+            'ref_comm_percent'      => (string)max(0, min(100, round((float)($_POST['ref_comm_percent'] ?? 5), 2))),
+            'ref_comm_spend_step'   => (string)max(1, round((float)($_POST['ref_comm_spend_step'] ?? 100), 2)),
+            'ref_comm_spend_reward' => (string)max(0, round((float)($_POST['ref_comm_spend_reward'] ?? 5), 2)),
+            'ref_comm_min_order'    => (string)max(0, round((float)($_POST['ref_comm_min_order'] ?? 0), 2)),
+        ];
+        $stmt = $pdo->prepare("INSERT INTO system_settings (setting_key, setting_value) VALUES (?, ?) ON DUPLICATE KEY UPDATE setting_value = ?");
+        foreach ($rc as $k => $v) { $stmt->execute([$k, $v, $v]); $settings[$k] = $v; }
+
+        // per-product rules
+        $types = $_POST['rc_type'] ?? [];
+        $vals  = $_POST['rc_value'] ?? [];
+        if (is_array($types)) {
+            $up  = $pdo->prepare("INSERT INTO ref_commission_products (product_id, comm_type, comm_value) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE comm_type = VALUES(comm_type), comm_value = VALUES(comm_value)");
+            $del = $pdo->prepare("DELETE FROM ref_commission_products WHERE product_id = ?");
+            foreach ($types as $pid => $t) {
+                $pid = (int)$pid;
+                $t   = in_array($t, ['default', 'off', 'percent', 'fixed'], true) ? $t : 'default';
+                $v   = max(0, round((float)($vals[$pid] ?? 0), 2));
+                if ($t === 'percent') $v = min(100, $v);
+                if ($pid <= 0) continue;
+                if ($t === 'default') $del->execute([$pid]); else $up->execute([$pid, $t, $v]);
+            }
+        }
+        $toast = ['type' => 'success', 'msg' => 'Referral commission rules saved! (' . ($rc['ref_comm_enabled'] === '1' ? 'ON' : 'OFF') . ')'];
     }
 
     // C. COUPON / PROMO CODE MANAGEMENT (100% FIXED & BULLETPROOF)
@@ -2643,7 +2806,119 @@ $providerBalance = km_get_cached_provider_balance($pdo);
                     </div>
                 </div>
             </div>
-        </section>
+        
+            <!-- ============ REFERRAL PURCHASE COMMISSION ============ -->
+            <?php
+                ffEnsureRefCommTables($pdo);
+                $rcCfgA   = ffRefCommConfig($settings);
+                $rcRules  = [];
+                try { foreach ($pdo->query("SELECT * FROM ref_commission_products")->fetchAll(PDO::FETCH_ASSOC) as $r) $rcRules[(int)$r['product_id']] = $r; } catch (Throwable $e) {}
+                $rcRecent = [];
+                $rcTotal  = 0.0;
+                try {
+                    $rcRecent = $pdo->query("SELECT l.*, r.username AS ref_name, b.username AS buyer_name, p.name AS product_name FROM ref_commission_log l LEFT JOIN users r ON r.id = l.referrer_id LEFT JOIN users b ON b.id = l.buyer_id LEFT JOIN products p ON p.id = l.product_id ORDER BY l.id DESC LIMIT 15")->fetchAll(PDO::FETCH_ASSOC);
+                    $rcTotal  = (float)$pdo->query("SELECT COALESCE(SUM(commission_bdt),0) FROM ref_commission_log")->fetchColumn();
+                } catch (Throwable $e) {}
+            ?>
+            <div class="box-panel p-5 space-y-4 border-amber-200">
+                <div class="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-slate-100 gap-3">
+                    <div>
+                        <h3 class="text-xs font-black text-slate-900 uppercase tracking-wider flex items-center gap-2">
+                            <i class="fa-solid fa-hand-holding-dollar text-amber-500"></i> REFER PURCHASE COMMISSION
+                        </h3>
+                        <span class="text-[11px] text-slate-500 font-sans mt-0.5 block">
+                            কারো রেফারে অ্যাকাউন্ট খোলা ইউজার প্রোডাক্ট কিনলে রেফারার কমিশন পাবে (সরাসরি ওয়ালেটে)।
+                        </span>
+                    </div>
+                    <span class="px-3 py-1 rounded-full text-xs font-bold uppercase <?= $rcCfgA['enabled'] ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-slate-100 text-slate-500 border border-slate-200' ?>">
+                        <?= $rcCfgA['enabled'] ? 'COMMISSION ON' : 'OFF' ?> · Paid ৳<?= number_format($rcTotal, 2) ?>
+                    </span>
+                </div>
+
+                <form method="POST" class="space-y-4 text-xs">
+                    <input type="hidden" name="admin_action" value="save_ref_commission">
+                    <input type="hidden" name="active_tab" value="tab-referral">
+
+                    <div class="bg-slate-50 p-3.5 rounded-xl border border-slate-200 flex items-center justify-between">
+                        <div>
+                            <span class="text-slate-900 font-bold block">Enable Purchase Commission</span>
+                            <span class="text-[10px] text-slate-400 font-sans">ON করলে রেফারার কেনাকাটার উপর কমিশন পাবে</span>
+                        </div>
+                        <input type="checkbox" name="ref_comm_enabled" value="1" <?= $rcCfgA['enabled'] ? 'checked' : '' ?> class="rounded scale-125 text-emerald-600">
+                    </div>
+
+                    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div>
+                            <label class="text-slate-700 block mb-1 font-bold">কত দিন কমিশন পাবে (Days)</label>
+                            <input type="number" min="0" step="1" name="ref_comm_days" value="<?= (int)$rcCfgA['days'] ?>" class="w-full bg-white border border-slate-200 p-2.5 rounded-xl outline-none focus:border-emerald-600">
+                            <span class="text-[10px] text-slate-400 font-sans">বন্ধু জয়েন করার পর এত দিন পর্যন্ত। 0 = সারাজীবন।</span>
+                        </div>
+                        <div>
+                            <label class="text-slate-700 block mb-1 font-bold">Minimum Order (৳)</label>
+                            <input type="number" min="0" step="0.01" name="ref_comm_min_order" value="<?= htmlspecialchars((string)$rcCfgA['min_order']) ?>" class="w-full bg-white border border-slate-200 p-2.5 rounded-xl outline-none focus:border-emerald-600">
+                            <span class="text-[10px] text-slate-400 font-sans">এর কম অর্ডারে কমিশন হবে না। 0 = সব অর্ডারে।</span>
+                        </div>
+                    </div>
+
+                    <div class="bg-amber-50/60 p-3.5 rounded-xl border border-amber-200 space-y-3">
+                        <span class="text-slate-900 font-bold block">Default Commission Rule (সব প্রোডাক্টে)</span>
+                        <label class="flex items-start gap-2 cursor-pointer">
+                            <input type="radio" name="ref_comm_mode" value="percent" <?= $rcCfgA['mode'] === 'percent' ? 'checked' : '' ?> class="mt-1">
+                            <span class="flex-1">
+                                <b>Percent:</b> অর্ডারের
+                                <input type="number" min="0" max="100" step="0.01" name="ref_comm_percent" value="<?= htmlspecialchars((string)$rcCfgA['percent']) ?>" class="w-20 bg-white border border-slate-200 p-1.5 rounded-lg outline-none text-center font-bold">
+                                % কমিশন
+                            </span>
+                        </label>
+                        <label class="flex items-start gap-2 cursor-pointer">
+                            <input type="radio" name="ref_comm_mode" value="spend" <?= $rcCfgA['mode'] === 'spend' ? 'checked' : '' ?> class="mt-1">
+                            <span class="flex-1">
+                                <b>Spend:</b> প্রতি ৳
+                                <input type="number" min="1" step="0.01" name="ref_comm_spend_step" value="<?= htmlspecialchars((string)$rcCfgA['spend_step']) ?>" class="w-20 bg-white border border-slate-200 p-1.5 rounded-lg outline-none text-center font-bold">
+                                খরচে ৳
+                                <input type="number" min="0" step="0.01" name="ref_comm_spend_reward" value="<?= htmlspecialchars((string)$rcCfgA['spend_reward']) ?>" class="w-20 bg-white border border-slate-200 p-1.5 rounded-lg outline-none text-center font-bold">
+                                কমিশন
+                            </span>
+                        </label>
+                    </div>
+
+                    <div class="space-y-2">
+                        <span class="text-slate-900 font-bold block">Product অনুযায়ী আলাদা কমিশন</span>
+                        <span class="text-[10px] text-slate-400 font-sans block">Default = উপরের নিয়ম · Off = এই প্রোডাক্টে কমিশন নেই · % = অর্ডারের % · Fixed ৳ = প্রতি পিস এত টাকা</span>
+                        <div class="max-h-80 overflow-y-auto space-y-1.5 pr-1">
+                            <?php foreach (($productsQuery ?? []) as $rcp): $pid = (int)$rcp['id']; $rr = $rcRules[$pid] ?? null; $rt = $rr['comm_type'] ?? 'default'; ?>
+                                <div class="flex items-center gap-2 bg-white border border-slate-200 rounded-xl p-2">
+                                    <span class="flex-1 truncate font-bold text-slate-800 text-[11px]"><?= htmlspecialchars($rcp['name']) ?></span>
+                                    <select name="rc_type[<?= $pid ?>]" class="bg-slate-50 border border-slate-200 p-1.5 rounded-lg text-[11px] outline-none">
+                                        <option value="default" <?= $rt === 'default' ? 'selected' : '' ?>>Default</option>
+                                        <option value="off" <?= $rt === 'off' ? 'selected' : '' ?>>Off</option>
+                                        <option value="percent" <?= $rt === 'percent' ? 'selected' : '' ?>>%</option>
+                                        <option value="fixed" <?= $rt === 'fixed' ? 'selected' : '' ?>>Fixed ৳</option>
+                                    </select>
+                                    <input type="number" min="0" step="0.01" name="rc_value[<?= $pid ?>]" value="<?= htmlspecialchars((string)($rr['comm_value'] ?? '0')) ?>" class="w-20 bg-slate-50 border border-slate-200 p-1.5 rounded-lg text-[11px] outline-none text-center">
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
+                    </div>
+
+                    <button type="submit" class="w-full py-3 bg-amber-500 hover:bg-amber-600 text-white font-extrabold rounded-xl uppercase text-xs shadow-md transition active:scale-95">
+                        Save Commission Rules
+                    </button>
+                </form>
+
+                <div class="space-y-1.5">
+                    <span class="text-slate-900 font-bold text-xs block">Recent Commissions</span>
+                    <?php if (empty($rcRecent)): ?>
+                        <p class="text-[11px] text-slate-400 font-sans">এখনো কোনো কমিশন হয়নি।</p>
+                    <?php else: foreach ($rcRecent as $rl): ?>
+                        <div class="flex items-center justify-between bg-slate-50 border border-slate-200 rounded-xl p-2 text-[11px]">
+                            <span class="truncate"><b><?= htmlspecialchars($rl['ref_name'] ?? '#' . $rl['referrer_id']) ?></b> ← <?= htmlspecialchars($rl['buyer_name'] ?? '#' . $rl['buyer_id']) ?> · <?= htmlspecialchars($rl['product_name'] ?? '') ?> (৳<?= number_format((float)$rl['order_bdt'], 0) ?>)</span>
+                            <span class="font-black text-emerald-700 whitespace-nowrap">+৳<?= number_format((float)$rl['commission_bdt'], 2) ?></span>
+                        </div>
+                    <?php endforeach; endif; ?>
+                </div>
+            </div>
+</section>
 
         <!-- =============================================================== -->
         <!-- 4. PRODUCTS CATALOG TAB (SYNC, INVENTORY & PLANS)               -->

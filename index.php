@@ -502,6 +502,7 @@ function ffDeliverOrder(PDO $pdo, int $orderId): array {
         } catch (Throwable $e) {}
 
         ffSpinAddSpend($pdo, $GLOBALS['settings'] ?? [], $userId, (float)$o['total_bdt']);
+        ffReferralCommission($pdo, $GLOBALS['settings'] ?? [], $userId, (int)($o['product_id'] ?? 0), (float)$o['total_bdt'], (int)($o['quantity'] ?? 1), 'ORD-' . (int)$orderId);
 
         return [
             'status'       => 'success',
@@ -763,6 +764,129 @@ function ffPlanPrice(array $pl, string $role, float $userDiscPercent = 0.0): arr
     $ud    = max(0.0, min(99.0, $userDiscPercent));
     $final = ($ud > 0) ? round($base * (1 - $ud / 100), 2) : round($base, 2);
     return [max(0.01, $final), round($original, 2)];
+}
+
+// ====================================================================
+// REFERRAL PURCHASE COMMISSION
+//  When a referred user buys a product, the referrer earns commission.
+//  Admin sets: ON/OFF, how many days after signup (0 = lifetime),
+//  mode = percent (X% of order) OR spend (every ৳X spent = ৳Y),
+//  minimum order, and per-product override (off / % / fixed ৳ per item).
+// ====================================================================
+if (!function_exists('ffEnsureRefCommTables')) {
+    function ffEnsureRefCommTables(PDO $pdo): void {
+        static $done = false;
+        if ($done) return;
+        $done = true;
+        try {
+            $pdo->exec("CREATE TABLE IF NOT EXISTS `ref_commission_products` (
+                `product_id` INT NOT NULL PRIMARY KEY,
+                `comm_type` VARCHAR(10) NOT NULL DEFAULT 'default',
+                `comm_value` DECIMAL(10,2) NOT NULL DEFAULT 0.00
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+            $pdo->exec("CREATE TABLE IF NOT EXISTS `ref_commission_log` (
+                `id` INT AUTO_INCREMENT PRIMARY KEY,
+                `order_ref` VARCHAR(80) NOT NULL,
+                `referrer_id` INT NOT NULL,
+                `buyer_id` INT NOT NULL,
+                `product_id` INT NOT NULL DEFAULT 0,
+                `order_bdt` DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+                `commission_bdt` DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+                `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY `uq_order_ref` (`order_ref`),
+                INDEX (`referrer_id`)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;");
+        } catch (Throwable $e) {}
+    }
+}
+
+if (!function_exists('ffRefCommConfig')) {
+    function ffRefCommConfig(array $s): array {
+        return [
+            'enabled'      => (($s['ref_comm_enabled'] ?? '0') === '1'),
+            'days'         => max(0, (int)($s['ref_comm_days'] ?? 30)),
+            'mode'         => (($s['ref_comm_mode'] ?? 'percent') === 'spend') ? 'spend' : 'percent',
+            'percent'      => max(0.0, min(100.0, (float)($s['ref_comm_percent'] ?? 5))),
+            'spend_step'   => max(1.0, (float)($s['ref_comm_spend_step'] ?? 100)),
+            'spend_reward' => max(0.0, (float)($s['ref_comm_spend_reward'] ?? 5)),
+            'min_order'    => max(0.0, (float)($s['ref_comm_min_order'] ?? 0)),
+        ];
+    }
+}
+
+if (!function_exists('ffReferralCommission')) {
+    /**
+     * Call AFTER a purchase is committed (never inside an open DB transaction).
+     * $orderBdt = what the buyer paid in BDT, $qty = items bought.
+     */
+    function ffReferralCommission(PDO $pdo, array $settings, int $buyerId, int $productId, float $orderBdt, int $qty, string $orderRef): void {
+        $cfg = ffRefCommConfig($settings);
+        if (!$cfg['enabled'] || $buyerId <= 0 || $orderBdt <= 0) return;
+        if (($settings['referral_system_status'] ?? '1') !== '1') return;
+        if ($cfg['min_order'] > 0 && $orderBdt < $cfg['min_order']) return;
+        try {
+            ffEnsureRefCommTables($pdo);
+
+            $st = $pdo->prepare("SELECT `referred_by`, `username`, `created_at` FROM `users` WHERE `id` = ? LIMIT 1");
+            $st->execute([$buyerId]);
+            $buyer = $st->fetch(PDO::FETCH_ASSOC);
+            $refId = (int)($buyer['referred_by'] ?? 0);
+            if (!$buyer || $refId <= 0 || $refId === $buyerId) return;
+
+            // only for N days after the buyer's signup (0 = lifetime)
+            if ($cfg['days'] > 0 && !empty($buyer['created_at'])) {
+                $joined = strtotime((string)$buyer['created_at']);
+                if ($joined && (time() - $joined) > $cfg['days'] * 86400) return;
+            }
+
+            $st = $pdo->prepare("SELECT `id`, `status`, `custom_bdt_rate` FROM `users` WHERE `id` = ? LIMIT 1");
+            $st->execute([$refId]);
+            $ref = $st->fetch(PDO::FETCH_ASSOC);
+            if (!$ref || ($ref['status'] ?? 'active') !== 'active') return;
+
+            // per-product rule
+            $type = 'default'; $val = 0.0;
+            if ($productId > 0) {
+                $st = $pdo->prepare("SELECT `comm_type`, `comm_value` FROM `ref_commission_products` WHERE `product_id` = ? LIMIT 1");
+                $st->execute([$productId]);
+                if ($pr = $st->fetch(PDO::FETCH_ASSOC)) { $type = (string)$pr['comm_type']; $val = (float)$pr['comm_value']; }
+            }
+            if ($type === 'off') return;
+
+            if ($type === 'percent') {
+                $comm = $orderBdt * max(0.0, min(100.0, $val)) / 100;
+            } elseif ($type === 'fixed') {
+                $comm = max(0.0, $val) * max(1, $qty);
+            } elseif ($cfg['mode'] === 'spend') {
+                $comm = floor($orderBdt / $cfg['spend_step']) * $cfg['spend_reward'];
+            } else {
+                $comm = $orderBdt * $cfg['percent'] / 100;
+            }
+            $comm = round(min($comm, $orderBdt), 2);
+            if ($comm <= 0) return;
+
+            $rate = (float)($ref['custom_bdt_rate'] ?? 0) > 0 ? (float)$ref['custom_bdt_rate'] : max(1.0, (float)($settings['usdt_rate'] ?? 125));
+            $commUsd = round($comm / $rate, 4);
+
+            $pdo->beginTransaction();
+            $ins = $pdo->prepare("INSERT IGNORE INTO `ref_commission_log` (`order_ref`, `referrer_id`, `buyer_id`, `product_id`, `order_bdt`, `commission_bdt`) VALUES (?, ?, ?, ?, ?, ?)");
+            $ins->execute([substr($orderRef, 0, 80), $refId, $buyerId, $productId, round($orderBdt, 2), $comm]);
+            if ($ins->rowCount() === 0) { $pdo->rollBack(); return; } // already paid for this order
+
+            $pdo->prepare("UPDATE `users` SET `balance` = `balance` + ?, `referral_earnings` = `referral_earnings` + ? WHERE `id` = ?")
+                ->execute([$commUsd, $comm, $refId]);
+            $pdo->prepare("INSERT INTO `transactions` (`user_id`, `method`, `amount`, `bonus_amount`, `sender_num`, `trx_id`, `status`) VALUES (?, 'Referral Commission', ?, 0.00, ?, ?, 'approved')")
+                ->execute([$refId, $commUsd, 'From: ' . (string)($buyer['username'] ?? ''), 'REFC-' . strtoupper(substr(md5($orderRef), 0, 12))]);
+            $trxRowId = (int)$pdo->lastInsertId();
+            $pdo->commit();
+
+            try {
+                if ($trxRowId > 0) $pdo->prepare("UPDATE `transactions` SET `amount_bdt` = ? WHERE `id` = ?")->execute([$comm, $trxRowId]);
+            } catch (Throwable $e) {}
+        } catch (Throwable $e) {
+            try { if ($pdo->inTransaction()) $pdo->rollBack(); } catch (Throwable $e2) {}
+        }
+    }
 }
 
 // ====================================================================
@@ -1932,6 +2056,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'verify_and_delive
 
         recordLiveActivity($pdo, $user['username'], 'purchase', 'Purchased ' . $productFullName, $totalCostBdt);
         ffSpinAddSpend($pdo, $settings, (int)$user['id'], (float)$totalCostBdt);
+        ffReferralCommission($pdo, $settings, (int)$user['id'], (int)($plan['real_product_id'] ?? 0), (float)$totalCostBdt, (int)$quantity, 'WAL-' . (int)$user['id'] . '-' . uniqid('', true));
 
         echo json_encode([
             'status'       => 'success',
@@ -2240,6 +2365,7 @@ if (isset($_POST['ajax_action']) && $_POST['ajax_action'] === 'live_generate') {
         recordLiveActivity($pdo, $user['username'], 'purchase', 'Purchased ' . $productFullName, $totalBdtCost);
         if ($paymentType !== 'coins') {
             ffSpinAddSpend($pdo, $settings, (int)$user['id'], (float)$totalBdtCost);
+            ffReferralCommission($pdo, $settings, (int)$user['id'], (int)($plan['real_product_id'] ?? 0), (float)$totalBdtCost, (int)$quantity, 'GEN-' . (int)$user['id'] . '-' . uniqid('', true));
         }
 
         echo json_encode([
@@ -3979,6 +4105,13 @@ $googleAuthUrl = 'https://accounts.google.com/o/oauth2/auth?scope=' . urlencode(
                             <?php endif; ?>
                             </span>
                         </p>
+                        <?php $rcCfg = ffRefCommConfig($settings); if ($rcCfg['enabled'] && ($settings['referral_system_status'] ?? '1') === '1'): ?>
+                        <p class="text-[11px] text-white font-bengali max-w-sm mx-auto bg-black/20 rounded-xl px-3 py-2 mt-1">
+                            🎁 আপনার রেফারে আসা বন্ধু প্রোডাক্ট কিনলে আপনি পাবেন
+                            <b><?= $rcCfg['mode'] === 'spend' ? ('প্রতি ৳' . rtrim(rtrim(number_format($rcCfg['spend_step'], 2), '0'), '.') . ' কেনায় ৳' . rtrim(rtrim(number_format($rcCfg['spend_reward'], 2), '0'), '.')) : (rtrim(rtrim(number_format($rcCfg['percent'], 2), '0'), '.') . '% কমিশন') ?></b>
+                            — <?= $rcCfg['days'] > 0 ? ('জয়েন করার পর ' . $rcCfg['days'] . ' দিন পর্যন্ত') : 'সারাজীবন' ?>, সরাসরি ওয়ালেটে!
+                        </p>
+                        <?php endif; ?>
                     </div>
 
                     <div class="bg-white/10 backdrop-blur-md p-3.5 rounded-2xl border border-white/20 max-w-sm mx-auto flex items-center justify-between">

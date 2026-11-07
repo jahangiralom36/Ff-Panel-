@@ -69,5 +69,25 @@ CREATE TABLE IF NOT EXISTS `trx_verify_attempts` (
     `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- ---------- referral purchase commission ----------
+CREATE TABLE IF NOT EXISTS `ref_commission_products` (
+    `product_id` INT NOT NULL PRIMARY KEY,
+    `comm_type` VARCHAR(10) NOT NULL DEFAULT 'default',
+    `comm_value` DECIMAL(10,2) NOT NULL DEFAULT 0.00
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS `ref_commission_log` (
+    `id` INT AUTO_INCREMENT PRIMARY KEY,
+    `order_ref` VARCHAR(80) NOT NULL,
+    `referrer_id` INT NOT NULL,
+    `buyer_id` INT NOT NULL,
+    `product_id` INT NOT NULL DEFAULT 0,
+    `order_bdt` DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    `commission_bdt` DECIMAL(12,2) NOT NULL DEFAULT 0.00,
+    `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY `uq_order_ref` (`order_ref`),
+    INDEX (`referrer_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 DROP PROCEDURE IF EXISTS ff_add_col;
 -- Done.
